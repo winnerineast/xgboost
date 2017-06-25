@@ -125,15 +125,19 @@ object XGBoost extends Serializable {
           }
           val partitionItr = fromDenseToSparseLabeledPoints(trainingSamples, missing)
           val trainingSet = new DMatrix(new JDMatrix(partitionItr, cacheFileName))
-          if (xgBoostConfMap.contains("groupData") && xgBoostConfMap("groupData") != null) {
-            trainingSet.setGroup(xgBoostConfMap("groupData").asInstanceOf[Seq[Seq[Int]]](
-                TaskContext.getPartitionId()).toArray)
+          try {
+            if (xgBoostConfMap.contains("groupData") && xgBoostConfMap("groupData") != null) {
+              trainingSet.setGroup(xgBoostConfMap("groupData").asInstanceOf[Seq[Seq[Int]]](
+                  TaskContext.getPartitionId()).toArray)
+            }
+            booster = SXGBoost.train(trainingSet, xgBoostConfMap, round,
+              watches = new mutable.HashMap[String, DMatrix] {
+                put("train", trainingSet)
+              }.toMap, obj, eval)
+            Rabit.shutdown()
+          } finally {
+            trainingSet.delete()
           }
-          booster = SXGBoost.train(trainingSet, xgBoostConfMap, round,
-            watches = new mutable.HashMap[String, DMatrix] {
-              put("train", trainingSet)
-            }.toMap, obj, eval)
-          Rabit.shutdown()
         } else {
           Rabit.shutdown()
           throw new XGBoostError(s"detect the empty partition in training dataset, partition ID:" +
@@ -283,22 +287,26 @@ object XGBoost extends Serializable {
         "instance of TrackerConf.")
     }
     val tracker = startTracker(nWorkers, trackerConf)
-    val overridedConfMap = overrideParamMapAccordingtoTaskCPUs(params, trainingData.sparkContext)
-    val boosters = buildDistributedBoosters(trainingData, overridedConfMap,
-      tracker.getWorkerEnvs, nWorkers, round, obj, eval, useExternalMemory, missing)
-    val sparkJobThread = new Thread() {
-      override def run() {
-        // force the job
-        boosters.foreachPartition(() => _)
+    try {
+      val overridedConfMap = overrideParamMapAccordingtoTaskCPUs(params, trainingData.sparkContext)
+      val boosters = buildDistributedBoosters(trainingData, overridedConfMap,
+        tracker.getWorkerEnvs, nWorkers, round, obj, eval, useExternalMemory, missing)
+      val sparkJobThread = new Thread() {
+        override def run() {
+          // force the job
+          boosters.foreachPartition(() => _)
+        }
       }
+      sparkJobThread.setUncaughtExceptionHandler(tracker)
+      sparkJobThread.start()
+      val isClsTask = isClassificationTask(params)
+      val trackerReturnVal = tracker.waitFor(0L)
+      logger.info(s"Rabit returns with exit code $trackerReturnVal")
+      postTrackerReturnProcessing(trackerReturnVal, boosters, overridedConfMap, sparkJobThread,
+        isClsTask)
+    } finally {
+      tracker.stop()
     }
-    sparkJobThread.setUncaughtExceptionHandler(tracker)
-    sparkJobThread.start()
-    val isClsTask = isClassificationTask(params)
-    val trackerReturnVal = tracker.waitFor(0L)
-    logger.info(s"Rabit returns with exit code $trackerReturnVal")
-    postTrackerReturnProcessing(trackerReturnVal, boosters, overridedConfMap, sparkJobThread,
-      isClsTask)
   }
 
   private def postTrackerReturnProcessing(
