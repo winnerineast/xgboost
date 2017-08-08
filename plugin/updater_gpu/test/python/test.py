@@ -29,13 +29,14 @@ class TestGPU(unittest.TestCase):
 
         ag_param = {'max_depth': 2,
                     'tree_method': 'exact',
-                    'nthread': 1,
+                    'nthread': 0,
                     'eta': 1,
                     'silent': 1,
                     'objective': 'binary:logistic',
                     'eval_metric': 'auc'}
         ag_param2 = {'max_depth': 2,
-                     'updater': 'grow_gpu',
+                     'tree_method': 'gpu_exact',
+                     'nthread': 0,
                      'eta': 1,
                      'silent': 1,
                      'objective': 'binary:logistic',
@@ -59,7 +60,8 @@ class TestGPU(unittest.TestCase):
         dtest = xgb.DMatrix(X_test, y_test)
 
         param = {'objective': 'binary:logistic',
-                 'updater': 'grow_gpu',
+                 'nthread': 0,
+                 'tree_method': 'gpu_exact',
                  'max_depth': 3,
                  'eval_metric': 'auc'}
         res = {}
@@ -75,7 +77,8 @@ class TestGPU(unittest.TestCase):
         dtrain2 = xgb.DMatrix(X2, label=y2)
 
         param = {'objective': 'binary:logistic',
-                 'updater': 'grow_gpu',
+                 'nthread': 0,
+                 'tree_method': 'gpu_exact',
                  'max_depth': 2,
                  'eval_metric': 'auc'}
         res = {}
@@ -128,26 +131,28 @@ class TestGPU(unittest.TestCase):
                 # regression test --- hist must be same as exact on all-categorial data
                 ag_param = {'max_depth': max_depth,
                             'tree_method': 'exact',
-                            'nthread': 1,
+                            'nthread': 0,
                             'eta': 1,
                             'silent': 1,
                             'objective': 'binary:logistic',
                             'eval_metric': 'auc'}
                 ag_param2 = {'max_depth': max_depth,
-                             'updater': 'grow_gpu_hist',
+                             'nthread': 0,
+                             'tree_method': 'gpu_hist',
                              'eta': 1,
                              'silent': 1,
                              'n_gpus': 1,
                              'objective': 'binary:logistic',
-                                 'max_bin': max_bin,
+                             'max_bin': max_bin,
                              'eval_metric': 'auc'}
                 ag_param3 = {'max_depth': max_depth,
-                             'updater': 'grow_gpu_hist',
+                             'nthread': 0,
+                             'tree_method': 'gpu_hist',
                              'eta': 1,
                              'silent': 1,
                              'n_gpus': n_gpus,
-                                 'objective': 'binary:logistic',
-                                 'max_bin': max_bin,
+                             'objective': 'binary:logistic',
+                             'max_bin': max_bin,
                              'eval_metric': 'auc'}
                 ag_res = {}
                 ag_res2 = {}
@@ -177,7 +182,8 @@ class TestGPU(unittest.TestCase):
                 dtest = xgb.DMatrix(X_test, y_test)
 
                 param = {'objective': 'binary:logistic',
-                         'updater': 'grow_gpu_hist',
+                         'tree_method': 'gpu_hist',
+                         'nthread': 0,
                          'max_depth': max_depth,
                          'n_gpus': 1,
                          'max_bin': max_bin,
@@ -189,7 +195,8 @@ class TestGPU(unittest.TestCase):
                 assert self.non_decreasing(res['train']['auc'])
                 #assert self.non_decreasing(res['test']['auc'])
                 param2 = {'objective': 'binary:logistic',
-                          'updater': 'grow_gpu_hist',
+                          'nthread': 0,
+                          'tree_method': 'gpu_hist',
                           'max_depth': max_depth,
                           'n_gpus': n_gpus,
                           'max_bin': max_bin,
@@ -211,7 +218,8 @@ class TestGPU(unittest.TestCase):
                 dtrain2 = xgb.DMatrix(X2, label=y2)
 
                 param = {'objective': 'binary:logistic',
-                         'updater': 'grow_gpu_hist',
+                         'nthread': 0,
+                         'tree_method': 'gpu_hist',
                          'max_depth': max_depth,
                          'n_gpus': n_gpus,
                          'max_bin': max_bin,
@@ -250,7 +258,8 @@ class TestGPU(unittest.TestCase):
                 ######################################################################
                 # fail-safe test for max_bin
                 param = {'objective': 'binary:logistic',
-                         'updater': 'grow_gpu_hist',
+                         'nthread': 0,
+                         'tree_method': 'gpu_hist',
                          'max_depth': max_depth,
                          'n_gpus': n_gpus,
                          'eval_metric': 'auc',
@@ -263,7 +272,8 @@ class TestGPU(unittest.TestCase):
                 ######################################################################
                 # subsampling
                 param = {'objective': 'binary:logistic',
-                         'updater': 'grow_gpu_hist',
+                         'nthread': 0,
+                         'tree_method': 'gpu_hist',
                          'max_depth': max_depth,
                          'n_gpus': n_gpus,
                          'eval_metric': 'auc',
@@ -279,7 +289,8 @@ class TestGPU(unittest.TestCase):
         ######################################################################
         # fail-safe test for max_bin=2
         param = {'objective': 'binary:logistic',
-                 'updater': 'grow_gpu_hist',
+                 'nthread': 0,
+                 'tree_method': 'gpu_hist',
                  'max_depth': 2,
                  'n_gpus': n_gpus,
                  'eval_metric': 'auc',
