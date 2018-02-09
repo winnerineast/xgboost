@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 #include "../../src/gbm/gbtree_model.h"
+#include "../../src/common/host_device_vector.h"
 
 // Forward declarations
 namespace xgboost {
@@ -51,10 +52,6 @@ class Predictor {
                     const std::vector<std::shared_ptr<DMatrix>>& cache);
 
   /**
-   * \fn  virtual void Predictor::PredictBatch( DMatrix* dmat,
-   * std::vector<bst_float>* out_preds, const gbm::GBTreeModel &model, int
-   * tree_begin, unsigned ntree_limit = 0) = 0;
-   *
    * \brief Generate batch predictions for a given feature matrix. May use
    * cached predictions if available instead of calculating from scratch.
    *
@@ -67,6 +64,22 @@ class Predictor {
    */
 
   virtual void PredictBatch(DMatrix* dmat, std::vector<bst_float>* out_preds,
+                            const gbm::GBTreeModel& model, int tree_begin,
+                            unsigned ntree_limit = 0) = 0;
+
+  /**
+   * \brief Generate batch predictions for a given feature matrix. May use
+   * cached predictions if available instead of calculating from scratch.
+   *
+   * \param [in,out]  dmat        Feature matrix.
+   * \param [in,out]  out_preds   The output preds.
+   * \param           model       The model to predict from.
+   * \param           tree_begin  The tree begin index.
+   * \param           ntree_limit (Optional) The ntree limit. 0 means do not
+   * limit trees.
+   */
+
+  virtual void PredictBatch(DMatrix* dmat, HostDeviceVector<bst_float>* out_preds,
                             const gbm::GBTreeModel& model, int tree_begin,
                             unsigned ntree_limit = 0) = 0;
 
@@ -140,14 +153,24 @@ class Predictor {
    * a vector of length (nfeats + 1) * num_output_group * nsample, arranged in
    * that order.
    *
-   * \param [in,out]  dmat          The input feature matrix.
-   * \param [in,out]  out_contribs  The output feature contribs.
-   * \param           model         Model to make predictions from.
-   * \param           ntree_limit   (Optional) The ntree limit.
-   * \param           approximate   Use fast approximate algorithm.
+   * \param [in,out]  dmat               The input feature matrix.
+   * \param [in,out]  out_contribs       The output feature contribs.
+   * \param           model              Model to make predictions from.
+   * \param           ntree_limit        (Optional) The ntree limit.
+   * \param           approximate        Use fast approximate algorithm.
+   * \param           condition          Condition on the condition_feature (0=no, -1=cond off, 1=cond on).
+   * \param           condition_feature  Feature to condition on (i.e. fix) during calculations.
    */
 
   virtual void PredictContribution(DMatrix* dmat,
+                                   std::vector<bst_float>* out_contribs,
+                                   const gbm::GBTreeModel& model,
+                                   unsigned ntree_limit = 0,
+                                   bool approximate = false,
+                                   int condition = 0,
+                                   unsigned condition_feature = 0) = 0;
+
+  virtual void PredictInteractionContributions(DMatrix* dmat,
                                    std::vector<bst_float>* out_contribs,
                                    const gbm::GBTreeModel& model,
                                    unsigned ntree_limit = 0,

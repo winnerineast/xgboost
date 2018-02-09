@@ -18,6 +18,7 @@
 #include "./data.h"
 #include "./objective.h"
 #include "./feature_map.h"
+#include "../../src/common/host_device_vector.h"
 
 namespace xgboost {
 /*!
@@ -70,6 +71,10 @@ class GradientBooster {
   virtual void DoBoost(DMatrix* p_fmat,
                        std::vector<bst_gpair>* in_gpair,
                        ObjFunction* obj = nullptr) = 0;
+  virtual void DoBoost(DMatrix* p_fmat,
+                       HostDeviceVector<bst_gpair>* in_gpair,
+                       ObjFunction* obj = nullptr);
+
   /*!
    * \brief generate predictions for given feature matrix
    * \param dmat feature matrix
@@ -80,6 +85,9 @@ class GradientBooster {
   virtual void PredictBatch(DMatrix* dmat,
                        std::vector<bst_float>* out_preds,
                        unsigned ntree_limit = 0) = 0;
+  virtual void PredictBatch(DMatrix* dmat,
+                            HostDeviceVector<bst_float>* out_preds,
+                            unsigned ntree_limit = 0);
   /*!
    * \brief online prediction function, predict score for one instance at a time
    *  NOTE: use the batch prediction interface if possible, batch prediction is usually
@@ -116,10 +124,17 @@ class GradientBooster {
    * \param ntree_limit limit the number of trees used in prediction, when it equals 0, this means
    *    we do not limit number of trees
    * \param approximate use a faster (inconsistent) approximation of SHAP values
+   * \param condition condition on the condition_feature (0=no, -1=cond off, 1=cond on).
+   * \param condition_feature feature to condition on (i.e. fix) during calculations
    */
   virtual void PredictContribution(DMatrix* dmat,
                            std::vector<bst_float>* out_contribs,
-                           unsigned ntree_limit = 0, bool approximate = false) = 0;
+                           unsigned ntree_limit = 0, bool approximate = false,
+                           int condition = 0, unsigned condition_feature = 0) = 0;
+
+  virtual void PredictInteractionContributions(DMatrix* dmat,
+                           std::vector<bst_float>* out_contribs,
+                           unsigned ntree_limit, bool approximate) = 0;
 
   /*!
    * \brief dump the model in the requested format
