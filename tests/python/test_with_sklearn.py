@@ -1,10 +1,22 @@
 import numpy as np
-import random
 import xgboost as xgb
 import testing as tm
+import tempfile
+import os
+import shutil
 from nose.tools import raises
 
 rng = np.random.RandomState(1994)
+
+
+class TemporaryDirectory(object):
+    """Context manager for tempfile.mkdtemp()"""
+    def __enter__(self):
+        self.name = tempfile.mkdtemp()
+        return self.name
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        shutil.rmtree(self.name)
 
 
 def test_binary_classification():
@@ -90,10 +102,6 @@ def test_feature_importances():
     X = pd.DataFrame(digits['data'])
     xgb_model = xgb.XGBClassifier(seed=0).fit(X, y)
     np.testing.assert_almost_equal(xgb_model.feature_importances_, exp)
-
-    # string columns, the feature order must be kept
-    chars = list('abcdefghijklmnopqrstuvwxyz')
-    X.columns = ["".join(random.sample(chars, 5)) for x in range(64)]
 
     xgb_model = xgb.XGBClassifier(seed=0).fit(X, y)
     np.testing.assert_almost_equal(xgb_model.feature_importances_, exp)
@@ -375,3 +383,122 @@ def test_sklearn_clone():
     clf = xgb.XGBClassifier(n_jobs=2, nthread=3)
     clf.n_jobs = -1
     clone(clf)
+
+
+def test_validation_weights_xgbmodel():
+    tm._skip_if_no_sklearn()
+    from sklearn.datasets import make_hastie_10_2
+
+    # prepare training and test data
+    X, y = make_hastie_10_2(n_samples=2000, random_state=42)
+    labels, y = np.unique(y, return_inverse=True)
+    X_train, X_test = X[:1600], X[1600:]
+    y_train, y_test = y[:1600], y[1600:]
+
+    # instantiate model
+    param_dist = {'objective': 'binary:logistic', 'n_estimators': 2,
+                  'random_state': 123}
+    clf = xgb.sklearn.XGBModel(**param_dist)
+
+    # train it using instance weights only in the training set
+    weights_train = np.random.choice([1, 2], len(X_train))
+    clf.fit(X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            eval_metric='logloss',
+            verbose=False)
+
+    # evaluate logloss metric on test set *without* using weights
+    evals_result_without_weights = clf.evals_result()
+    logloss_without_weights = evals_result_without_weights["validation_0"]["logloss"]
+
+    # now use weights for the test set
+    np.random.seed(0)
+    weights_test = np.random.choice([1, 2], len(X_test))
+    clf.fit(X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            sample_weight_eval_set=[weights_test],
+            eval_metric='logloss',
+            verbose=False)
+    evals_result_with_weights = clf.evals_result()
+    logloss_with_weights = evals_result_with_weights["validation_0"]["logloss"]
+
+    # check that the logloss in the test set is actually different when using weights
+    # than when not using them
+    assert all((logloss_with_weights[i] != logloss_without_weights[i] for i in [0, 1]))
+
+
+def test_validation_weights_xgbclassifier():
+    tm._skip_if_no_sklearn()
+    from sklearn.datasets import make_hastie_10_2
+
+    # prepare training and test data
+    X, y = make_hastie_10_2(n_samples=2000, random_state=42)
+    labels, y = np.unique(y, return_inverse=True)
+    X_train, X_test = X[:1600], X[1600:]
+    y_train, y_test = y[:1600], y[1600:]
+
+    # instantiate model
+    param_dist = {'objective': 'binary:logistic', 'n_estimators': 2,
+                  'random_state': 123}
+    clf = xgb.sklearn.XGBClassifier(**param_dist)
+
+    # train it using instance weights only in the training set
+    weights_train = np.random.choice([1, 2], len(X_train))
+    clf.fit(X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            eval_metric='logloss',
+            verbose=False)
+
+    # evaluate logloss metric on test set *without* using weights
+    evals_result_without_weights = clf.evals_result()
+    logloss_without_weights = evals_result_without_weights["validation_0"]["logloss"]
+
+    # now use weights for the test set
+    np.random.seed(0)
+    weights_test = np.random.choice([1, 2], len(X_test))
+    clf.fit(X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            sample_weight_eval_set=[weights_test],
+            eval_metric='logloss',
+            verbose=False)
+    evals_result_with_weights = clf.evals_result()
+    logloss_with_weights = evals_result_with_weights["validation_0"]["logloss"]
+
+    # check that the logloss in the test set is actually different when using weights
+    # than when not using them
+    assert all((logloss_with_weights[i] != logloss_without_weights[i] for i in [0, 1]))
+
+
+def test_save_load_model():
+    tm._skip_if_no_sklearn()
+    from sklearn.datasets import load_digits
+    try:
+        from sklearn.model_selection import KFold
+    except:
+        from sklearn.cross_validation import KFold
+
+    digits = load_digits(2)
+    y = digits['target']
+    X = digits['data']
+    try:
+        kf = KFold(y.shape[0], n_folds=2, shuffle=True, random_state=rng)
+    except TypeError:  # sklearn.model_selection.KFold uses n_split
+        kf = KFold(
+            n_splits=2, shuffle=True, random_state=rng
+        ).split(np.arange(y.shape[0]))
+    with TemporaryDirectory() as tempdir:
+        model_path = os.path.join(tempdir, 'digits.model')
+        for train_index, test_index in kf:
+            xgb_model = xgb.XGBClassifier().fit(X[train_index], y[train_index])
+            xgb_model.save_model(model_path)
+            xgb_model = xgb.XGBModel()
+            xgb_model.load_model(model_path)
+            preds = xgb_model.predict(X[test_index])
+            labels = y[test_index]
+            err = sum(1 for i in range(len(preds))
+                      if int(preds[i] > 0.5) != labels[i]) / float(len(preds))
+            assert err < 0.1

@@ -87,8 +87,7 @@ Parameters for Tree Booster
     - 'refresh': refreshes tree's statistics and/or leaf values based on the current data. Note that no random subsampling of data rows is performed.
     - 'prune': prunes the splits where loss < min_split_loss (or gamma).
   - In a distributed setting, the implicit updater sequence value would be adjusted as follows:
-    - 'grow_histmaker,prune' when  dsplit='row' (or default) and prob_buffer_row == 1 (or default); or when data has multiple sparse pages
-    - 'grow_histmaker,refresh,prune' when  dsplit='row' and prob_buffer_row < 1
+    - 'grow_histmaker,prune' when  dsplit='row' (or default); or when data has multiple sparse pages
     - 'distcol' when dsplit='col'
 * refresh_leaf, [default=1]
   - This is a parameter of the 'refresh' updater plugin. When this flag is true, tree leafs as well as tree nodes' stats are updated. When it is false, only node stats are updated.
@@ -142,11 +141,14 @@ Additional parameters for Dart Booster
 Parameters for Linear Booster
 -----------------------------
 * lambda [default=0, alias: reg_lambda]
-  - L2 regularization term on weights, increase this value will make model more conservative.
+  - L2 regularization term on weights, increase this value will make model more conservative. Normalised to number of training examples.
 * alpha [default=0, alias: reg_alpha]
-  - L1 regularization term on weights, increase this value will make model more conservative.
-* lambda_bias [default=0, alias: reg_lambda_bias]
-  - L2 regularization term on bias (no L1 reg on bias because it is not important)
+  - L1 regularization term on weights, increase this value will make model more conservative. Normalised to number of training examples.
+* updater [default='shotgun']
+	- Linear model algorithm
+      - 'shotgun': Parallel coordinate descent algorithm based on shotgun algorithm. Uses 'hogwild' parallelism and therefore produces a nondeterministic solution on each run. 
+      - 'coord_descent': Ordinary coordinate descent algorithm. Also multithreaded but still produces a deterministic solution. 
+
 
 Parameters for Tweedie Regression
 ---------------------------------

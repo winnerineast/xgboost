@@ -1,6 +1,15 @@
 Installation Guide
 ==================
 
+**NOTE**. If you are planning to use Python on a Linux system, consider installing XGBoost from a pre-built binary wheel. The wheel is available from Python Package Index (PyPI). You may download and install it by running
+```bash
+# Ensure that you are downloading xgboost-{version}-py2.py3-none-manylinux1_x86_64.whl
+pip3 install xgboost
+```
+* This package will support GPU algorithms (`gpu_exact`, `gpu_hist`) on machines with NVIDIA GPUs.
+* Currently, PyPI has a binary wheel only for 64-bit Linux.
+
+# Building XGBoost from source
 This page gives instructions on how to build and install the xgboost package from
 scratch on various systems. It consists of two steps:
 
@@ -85,12 +94,33 @@ Now, clone the repository
 
 ```bash
 git clone --recursive https://github.com/dmlc/xgboost
+cd xgboost; cp make/config.mk ./config.mk
+```
+
+Open config.mk and uncomment these two lines
+
+```config.mk
+export CC = gcc
+export CXX = g++
+```
+
+and replace these two lines into(5 or 6 or 7; depending on your gcc-version)
+
+```config.mk
+export CC = gcc-7
+export CXX = g++-7
+```
+
+To find your gcc version
+
+```bash
+gcc-version
 ```
 
 and build using the following commands
 
 ```bash
-cd xgboost; cp make/config.mk ./config.mk; make -j4
+make -j4
 ```
 head over to `Python Package Installation` for the next steps
 
@@ -111,26 +141,13 @@ After installing [Git for Windows](https://git-for-windows.github.io/), you shou
 All the following steps are in the `Git Bash`.
 
 In MinGW, `make` command comes with the name `mingw32-make`. You can add the following line into the `.bashrc` file.
-
-> if you don't have a MinGW installed on your machine and you are using *Windows x86_64*. try to download one From
-
-> [https://sourceforge.net/projects/mingw-w64/](https://sourceforge.net/projects/mingw-w64/)
-
-> after the installation, add the path of your installation to the system *env* properties.
-
-> the installation path added to your *env* properties should be pointed to the `bin` folder, like:
-
-> `C:\Program Files\mingw-w64\x86_64-7.2.0-posix-seh-rt_v5-rev1\mingw64\bin`
-
-> for users using *Windows 32*, try to find a *mingw32* version instead.
-
-> you are ok to follow the below instructions.
-
 ```bash
 alias make='mingw32-make'
 ```
+(On 64-bit Windows, you should get [mingw64](https://sourceforge.net/projects/mingw-w64/) instead.) Make sure
+that the path to MinGW is in the system PATH.
 
-To build with MinGW
+To build with MinGW, type:
 
 ```bash
 cp make/mingw64.mk config.mk; make -j4
@@ -186,6 +203,14 @@ If build seems to use only a single process, you might try to append an option l
 After the build process successfully ends, you will find a `xgboost.dll` library file inside `./lib/` folder, copy this file to the the API package folder like `python-package/xgboost` if you are using *python* API. And you are good to follow the below instructions.
 
 Unofficial windows binaries and instructions on how to use them are hosted on [Guido Tapia's blog](http://www.picnet.com.au/blogs/guido/post/2016/09/22/xgboost-windows-x64-binaries-for-download/)
+
+### Building with Multi-GPU support
+Multi-GPU support requires the [NCCL](https://developer.nvidia.com/nccl) library. With NCCL installed, run cmake as:
+```bash
+cmake .. -DUSE_CUDA=ON -DUSE_NCCL=ON -DNCCL_ROOT="<NCCL_DIRECTORY>"
+export LD_LIBRARY_PATH=<NCCL_DIRECTORY>/lib:$LD_LIBRARY_PATH
+```
+One can also pass NCCL_ROOT as an environment variable, in which case, this takes precedence over the cmake variable NCCL_ROOT.
 
 ### Customized Building
 
