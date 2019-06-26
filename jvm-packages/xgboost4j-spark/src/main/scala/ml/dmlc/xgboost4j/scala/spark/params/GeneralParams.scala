@@ -22,6 +22,14 @@ import ml.dmlc.xgboost4j.scala.spark.TrackerConf
 import org.apache.spark.ml.param._
 import scala.collection.mutable
 
+import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
+
+import org.apache.spark.ml.linalg.{DenseVector, SparseVector, Vector}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{Column, DataFrame, Row}
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.types.{FloatType, IntegerType}
+
 private[spark] trait GeneralParams extends Params {
 
   /**
@@ -57,13 +65,26 @@ private[spark] trait GeneralParams extends Params {
   final def getUseExternalMemory: Boolean = $(useExternalMemory)
 
   /**
+   * Deprecated. Please use verbosity instead.
    * 0 means printing running messages, 1 means silent mode. default: 0
    */
   final val silent = new IntParam(this, "silent",
+    "Deprecated. Please use verbosity instead. " +
     "0 means printing running messages, 1 means silent mode.",
     (value: Int) => value >= 0 && value <= 1)
 
   final def getSilent: Int = $(silent)
+
+  /**
+   * Verbosity of printing messages. Valid values are 0 (silent), 1 (warning), 2 (info), 3 (debug).
+   * default: 1
+   */
+  final val verbosity = new IntParam(this, "verbosity",
+    "Verbosity of printing messages. Valid values are 0 (silent), 1 (warning), 2 (info), " +
+    "3 (debug).",
+    (value: Int) => value >= 0 && value <= 3)
+
+  final def getVerbosity: Int = $(verbosity)
 
   /**
    * customized objective function provided by user. default: null
@@ -151,11 +172,34 @@ private[spark] trait GeneralParams extends Params {
   final def getSeed: Long = $(seed)
 
   setDefault(numRound -> 1, numWorkers -> 1, nthread -> 1,
-    useExternalMemory -> false, silent -> 0,
+    useExternalMemory -> false, silent -> 0, verbosity -> 1,
     customObj -> null, customEval -> null, missing -> Float.NaN,
     trackerConf -> TrackerConf(), seed -> 0, timeoutRequestWorkers -> 30 * 60 * 1000L,
-    checkpointPath -> "", checkpointInterval -> -1
-  )
+    checkpointPath -> "", checkpointInterval -> -1)
+}
+
+trait HasLeafPredictionCol extends Params {
+  /**
+   * Param for leaf prediction column name.
+   * @group param
+   */
+  final val leafPredictionCol: Param[String] = new Param[String](this, "leafPredictionCol",
+    "name of the predictLeaf results")
+
+  /** @group getParam */
+  final def getLeafPredictionCol: String = $(leafPredictionCol)
+}
+
+trait HasContribPredictionCol extends Params {
+  /**
+   * Param for contribution prediction column name.
+   * @group param
+   */
+  final val contribPredictionCol: Param[String] = new Param[String](this, "contribPredictionCol",
+    "name of the predictContrib results")
+
+  /** @group getParam */
+  final def getContribPredictionCol: String = $(contribPredictionCol)
 }
 
 trait HasBaseMarginCol extends Params {
@@ -200,10 +244,11 @@ private[spark] trait ParamMapFuncs extends Params {
   def XGBoostToMLlibParams(xgboostParams: Map[String, Any]): Unit = {
     for ((paramName, paramValue) <- xgboostParams) {
       if ((paramName == "booster" && paramValue != "gbtree") ||
-        (paramName == "updater" && paramValue != "grow_colmaker,prune")) {
+        (paramName == "updater" && paramValue != "grow_histmaker,prune" &&
+          paramValue != "hist")) {
         throw new IllegalArgumentException(s"you specified $paramName as $paramValue," +
           s" XGBoost-Spark only supports gbtree as booster type" +
-          " and grow_colmaker,prune as the updater type")
+          " and grow_histmaker,prune or hist as the updater type")
       }
       val name = CaseFormat.LOWER_UNDERSCORE.to(CaseFormat.LOWER_CAMEL, paramName)
       params.find(_.name == name) match {

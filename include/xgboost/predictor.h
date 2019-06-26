@@ -7,11 +7,15 @@
 #pragma once
 #include <xgboost/base.h>
 #include <xgboost/data.h>
+#include <xgboost/generic_parameters.h>
+
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
+
 #include "../../src/gbm/gbtree_model.h"
 #include "../../src/common/host_device_vector.h"
 
@@ -35,6 +39,9 @@ namespace xgboost {
  */
 
 class Predictor {
+ protected:
+  LearnerTrainParam const* learner_param_;
+
  public:
   virtual ~Predictor() = default;
 
@@ -167,7 +174,7 @@ class Predictor {
    *
    */
 
-  static Predictor* Create(std::string name);
+  static Predictor* Create(std::string const& name, LearnerTrainParam const*);
 
  protected:
   /**

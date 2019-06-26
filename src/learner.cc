@@ -1,26 +1,54 @@
 /*!
- * Copyright 2014 by Contributors
+ * Copyright 2014-2019 by Contributors
  * \file learner.cc
  * \brief Implementation of learning algorithm.
  * \author Tianqi Chen
  */
 #include <dmlc/io.h>
 #include <dmlc/timer.h>
+#include <xgboost/feature_map.h>
 #include <xgboost/learner.h>
 #include <xgboost/logging.h>
+#include <xgboost/generic_parameters.h>
 #include <algorithm>
 #include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <ios>
 #include <utility>
 #include <vector>
 #include "./common/common.h"
 #include "./common/host_device_vector.h"
 #include "./common/io.h"
 #include "./common/random.h"
-#include "common/timer.h"
+#include "./common/timer.h"
 
+namespace {
+
+const char* kMaxDeltaStepDefaultValue = "0.7";
+
+inline bool IsFloat(const std::string& str) {
+  std::stringstream ss(str);
+  float f;
+  return !((ss >> std::noskipws >> f).rdstate() ^ std::ios_base::eofbit);
+}
+
+inline bool IsInt(const std::string& str) {
+  std::stringstream ss(str);
+  int i;
+  return !((ss >> std::noskipws >> i).rdstate() ^ std::ios_base::eofbit);
+}
+
+inline std::string RenderParamVal(const std::string& str) {
+  if (IsFloat(str) || IsInt(str)) {
+    return str;
+  } else {
+    return std::string("'") + str + "'";
+  }
+}
+
+}  // anonymous namespace
 
 namespace xgboost {
 // implementation of base learner.
@@ -69,62 +97,6 @@ struct LearnerModelParam : public dmlc::Parameter<LearnerModelParam> {
   }
 };
 
-struct LearnerTrainParam : public dmlc::Parameter<LearnerTrainParam> {
-  // stored random seed
-  int seed;
-  // whether seed the PRNG each iteration
-  bool seed_per_iteration;
-  // data split mode, can be row, col, or none.
-  int dsplit;
-  // tree construction method
-  int tree_method;
-  // internal test flag
-  std::string test_flag;
-  // maximum row per batch.
-  size_t max_row_perbatch;
-  // number of threads to use if OpenMP is enabled
-  // if equals 0, use system default
-  int nthread;
-  // flag to print out detailed breakdown of runtime
-  int debug_verbose;
-  // declare parameters
-  DMLC_DECLARE_PARAMETER(LearnerTrainParam) {
-    DMLC_DECLARE_FIELD(seed).set_default(0).describe(
-        "Random number seed during training.");
-    DMLC_DECLARE_FIELD(seed_per_iteration)
-        .set_default(false)
-        .describe(
-            "Seed PRNG determnisticly via iterator number, "
-            "this option will be switched on automatically on distributed "
-            "mode.");
-    DMLC_DECLARE_FIELD(dsplit)
-        .set_default(0)
-        .add_enum("auto", 0)
-        .add_enum("col", 1)
-        .add_enum("row", 2)
-        .describe("Data split mode for distributed training.");
-    DMLC_DECLARE_FIELD(tree_method)
-        .set_default(0)
-        .add_enum("auto", 0)
-        .add_enum("approx", 1)
-        .add_enum("exact", 2)
-        .add_enum("hist", 3)
-        .add_enum("gpu_exact", 4)
-        .add_enum("gpu_hist", 5)
-        .describe("Choice of tree construction method.");
-    DMLC_DECLARE_FIELD(test_flag).set_default("").describe(
-        "Internal test flag");
-    DMLC_DECLARE_FIELD(max_row_perbatch)
-        .set_default(std::numeric_limits<size_t>::max())
-        .describe("maximum row per batch.");
-    DMLC_DECLARE_FIELD(nthread).set_default(0).describe(
-        "Number of threads to use.");
-    DMLC_DECLARE_FIELD(debug_verbose)
-        .set_lower_bound(0)
-        .set_default(0)
-        .describe("flag to print out detailed breakdown of runtime");
-  }
-};
 
 DMLC_REGISTER_PARAMETER(LearnerModelParam);
 DMLC_REGISTER_PARAMETER(LearnerTrainParam);
@@ -138,57 +110,38 @@ class LearnerImpl : public Learner {
   explicit LearnerImpl(std::vector<std::shared_ptr<DMatrix> >  cache)
       : cache_(std::move(cache)) {
     // boosted tree
-    name_obj_ = "reg:linear";
+    name_obj_ = "reg:squarederror";
     name_gbm_ = "gbtree";
   }
 
-  static void AssertGPUSupport() {
-#ifndef XGBOOST_USE_CUDA
-    LOG(FATAL) << "XGBoost version not compiled with GPU support.";
-#endif
-  }
+  void ConfigureObjective() {
+    if (cfg_.count("num_class") != 0) {
+      cfg_["num_output_group"] = cfg_["num_class"];
+      if (atoi(cfg_["num_class"].c_str()) > 1 && cfg_.count("objective") == 0) {
+        cfg_["objective"] = "multi:softmax";
+      }
+    }
 
-  void ConfigureUpdaters() {
-    if (tparam_.tree_method == 0 || tparam_.tree_method == 1 ||
-        tparam_.tree_method == 2) {
-      if (cfg_.count("updater") == 0) {
-        if (tparam_.dsplit == 1) {
-          cfg_["updater"] = "distcol";
-        } else if (tparam_.dsplit == 2) {
-          cfg_["updater"] = "grow_histmaker,prune";
-        }
-      }
-    } else if (tparam_.tree_method == 3) {
-      /* histogram-based algorithm */
-      LOG(CONSOLE) << "Tree method is selected to be \'hist\', which uses a "
-                      "single updater "
-                   << "grow_fast_histmaker.";
-      cfg_["updater"] = "grow_fast_histmaker";
-    } else if (tparam_.tree_method == 4) {
-      this->AssertGPUSupport();
-      if (cfg_.count("updater") == 0) {
-        cfg_["updater"] = "grow_gpu,prune";
-      }
-      if (cfg_.count("predictor") == 0) {
-        cfg_["predictor"] = "gpu_predictor";
-      }
-    } else if (tparam_.tree_method == 5) {
-      this->AssertGPUSupport();
-      if (cfg_.count("updater") == 0) {
-        cfg_["updater"] = "grow_gpu_hist";
-      }
-      if (cfg_.count("predictor") == 0) {
-        cfg_["predictor"] = "gpu_predictor";
-      }
+    if (cfg_.find("max_delta_step") == cfg_.cend() &&
+        cfg_.find("objective") != cfg_.cend() &&
+        cfg_["objective"] == "count:poisson") {
+      cfg_["max_delta_step"] = kMaxDeltaStepDefaultValue;
+    }
+
+    if (cfg_.count("objective") == 0) {
+      cfg_["objective"] = "reg:squarederror";
     }
   }
 
+  // Configuration before data is known.
   void Configure(
       const std::vector<std::pair<std::string, std::string> >& args) override {
     // add to configurations
     tparam_.InitAllowUnknown(args);
-    monitor_.Init("Learner", tparam_.debug_verbose);
+    ConsoleLogger::Configure(args.cbegin(), args.cend());
+    monitor_.Init("Learner");
     cfg_.clear();
+
     for (const auto& kv : args) {
       if (kv.first == "eval_metric") {
         // check duplication
@@ -196,7 +149,7 @@ class LearnerImpl : public Learner {
           return m->Name() != kv.second;
         };
         if (std::all_of(metrics_.begin(), metrics_.end(), dup_check)) {
-          metrics_.emplace_back(Metric::Create(kv.second));
+          metrics_.emplace_back(Metric::Create(kv.second, &tparam_));
           mparam_.contain_eval_metrics = 1;
         }
       } else {
@@ -209,35 +162,17 @@ class LearnerImpl : public Learner {
 
     // add additional parameters
     // These are cosntraints that need to be satisfied.
-    if (tparam_.dsplit == 0 && rabit::IsDistributed()) {
-      tparam_.dsplit = 2;
+    if (tparam_.dsplit == DataSplitMode::kAuto && rabit::IsDistributed()) {
+      tparam_.dsplit = DataSplitMode::kRow;
     }
 
-    if (cfg_.count("num_class") != 0) {
-      cfg_["num_output_group"] = cfg_["num_class"];
-      if (atoi(cfg_["num_class"].c_str()) > 1 && cfg_.count("objective") == 0) {
-        cfg_["objective"] = "multi:softmax";
-      }
-    }
+    ConfigureObjective();
+    name_gbm_ = tparam_.booster;
 
-    if (cfg_.count("max_delta_step") == 0 && cfg_.count("objective") != 0 &&
-        cfg_["objective"] == "count:poisson") {
-      cfg_["max_delta_step"] = "0.7";
-    }
-
-    ConfigureUpdaters();
-
-    if (cfg_.count("objective") == 0) {
-      cfg_["objective"] = "reg:linear";
-    }
-    if (cfg_.count("booster") == 0) {
-      cfg_["booster"] = "gbtree";
-    }
-
+    // FIXME(trivialfis): So which one should go first? Init or Configure?
     if (!this->ModelInitialized()) {
       mparam_.InitAllowUnknown(args);
       name_obj_ = cfg_["objective"];
-      name_gbm_ = cfg_["booster"];
       // set seed only before the model is initialized
       common::GlobalRandom().seed(tparam_.seed);
     }
@@ -252,11 +187,34 @@ class LearnerImpl : public Learner {
     if (obj_ != nullptr) {
       obj_->Configure(cfg_.begin(), cfg_.end());
     }
+
+    for (auto& p_metric : metrics_) {
+      p_metric->Configure(cfg_.begin(), cfg_.end());
+    }
   }
 
   void InitModel() override { this->LazyInitModel(); }
 
+  // Configuration can only be done after data is known
+  void ConfigurationWithKnownData(DMatrix* dmat) {
+    CHECK(ModelInitialized())
+        << " Internal Error: Always call InitModel or Load before any evaluation.";
+    this->ValidateDMatrix(dmat);
+    CHECK(this->gbm_) << " Internal: GBM is not set";
+    if (this->gbm_->UseGPU()) {
+      if (cfg_.find("n_gpus") == cfg_.cend()) {
+        tparam_.n_gpus = 1;
+      }
+      if (tparam_.n_gpus != 1) {
+        LOG(WARNING) << "Multi-GPU training is deprecated. "
+                        "Please use distributed GPU training with one process per GPU.";
+      }
+    }
+  }
+
   void Load(dmlc::Stream* fi) override {
+    tparam_ = LearnerTrainParam();
+    tparam_.Init(std::vector<std::pair<std::string, std::string>>{});
     // TODO(tqchen) mark deprecation of old format.
     common::PeekableInStream fp(fi);
     // backward compatible header check.
@@ -293,12 +251,49 @@ class LearnerImpl : public Learner {
     }
     CHECK(fi->Read(&name_gbm_)) << "BoostLearner: wrong model format";
     // duplicated code with LazyInitModel
-    obj_.reset(ObjFunction::Create(name_obj_));
-    gbm_.reset(GradientBooster::Create(name_gbm_, cache_, mparam_.base_score));
+    obj_.reset(ObjFunction::Create(name_obj_, &tparam_));
+    gbm_.reset(GradientBooster::Create(name_gbm_, &tparam_,
+                                       cache_, mparam_.base_score));
     gbm_->Load(fi);
     if (mparam_.contain_extra_attrs != 0) {
       std::vector<std::pair<std::string, std::string> > attr;
       fi->Read(&attr);
+      for (auto& kv : attr) {
+        // Load `predictor`, `n_gpus`, `gpu_id` parameters from extra attributes
+        const std::string prefix = "SAVED_PARAM_";
+        if (kv.first.find(prefix) == 0) {
+          const std::string saved_param = kv.first.substr(prefix.length());
+          bool is_gpu_predictor = saved_param == "predictor" && kv.second == "gpu_predictor";
+#ifdef XGBOOST_USE_CUDA
+          if (saved_param == "predictor" || saved_param == "n_gpus"
+              || saved_param == "gpu_id") {
+            cfg_[saved_param] = kv.second;
+            LOG(INFO)
+              << "Parameter '" << saved_param << "' has been recovered from "
+              << "the saved model. It will be set to "
+              << RenderParamVal(kv.second) << " for prediction. To "
+              << "override the predictor behavior, explicitly set '"
+              << saved_param << "' parameter as follows:\n"
+              << "  * Python package: bst.set_param('"
+              << saved_param << "', [new value])\n"
+              << "  * R package:      xgb.parameters(bst) <- list("
+              << saved_param << " = [new value])\n"
+              << "  * JVM packages:   bst.setParam(\""
+              << saved_param << "\", [new value])";
+          }
+#else
+          if (is_gpu_predictor) {
+            cfg_["predictor"] = "cpu_predictor";
+            kv.second = "cpu_predictor";
+          }
+#endif  // XGBOOST_USE_CUDA
+          // NO visiable GPU on current environment
+          if (is_gpu_predictor && GPUSet::AllVisible().Size() == 0) {
+            cfg_["predictor"] = "cpu_predictor";
+            kv.second = "cpu_predictor";
+          }
+        }
+      }
       attributes_ =
           std::map<std::string, std::string>(attr.begin(), attr.end());
     }
@@ -311,31 +306,69 @@ class LearnerImpl : public Learner {
       std::vector<std::string> metr;
       fi->Read(&metr);
       for (auto name : metr) {
-        metrics_.emplace_back(Metric::Create(name));
+        metrics_.emplace_back(
+            Metric::Create(name, &tparam_));
       }
     }
     cfg_["num_class"] = common::ToString(mparam_.num_class);
     cfg_["num_feature"] = common::ToString(mparam_.num_feature);
     obj_->Configure(cfg_.begin(), cfg_.end());
+
+    for (auto& p_metric : metrics_) {
+      p_metric->Configure(cfg_.begin(), cfg_.end());
+    }
   }
 
   // rabit save model to rabit checkpoint
   void Save(dmlc::Stream* fo) const override {
-    fo->Write(&mparam_, sizeof(LearnerModelParam));
+    LearnerModelParam mparam = mparam_;  // make a copy to potentially modify
+    std::vector<std::pair<std::string, std::string> > extra_attr;
+      // extra attributed to be added just before saving
+
+    if (name_obj_ == "count:poisson") {
+      auto it = cfg_.find("max_delta_step");
+      if (it != cfg_.end()) {
+        // write `max_delta_step` parameter as extra attribute of booster
+        mparam.contain_extra_attrs = 1;
+        extra_attr.emplace_back("count_poisson_max_delta_step", it->second);
+      }
+    }
+    {
+      // Write `predictor`, `n_gpus`, `gpu_id` parameters as extra attributes
+      for (const auto& key : std::vector<std::string>{
+                                   "predictor", "n_gpus", "gpu_id"}) {
+        auto it = cfg_.find(key);
+        if (it != cfg_.end()) {
+          mparam.contain_extra_attrs = 1;
+          extra_attr.emplace_back("SAVED_PARAM_" + key, it->second);
+        }
+      }
+    }
+    fo->Write(&mparam, sizeof(LearnerModelParam));
     fo->Write(name_obj_);
     fo->Write(name_gbm_);
     gbm_->Save(fo);
-    if (mparam_.contain_extra_attrs != 0) {
-      std::vector<std::pair<std::string, std::string> > attr(
-          attributes_.begin(), attributes_.end());
-      fo->Write(attr);
+    if (mparam.contain_extra_attrs != 0) {
+      std::map<std::string, std::string> attr(attributes_);
+      for (const auto& kv : extra_attr) {
+        attr[kv.first] = kv.second;
+      }
+      fo->Write(std::vector<std::pair<std::string, std::string>>(
+                  attr.begin(), attr.end()));
     }
     if (name_obj_ == "count:poisson") {
-      auto it =
-          cfg_.find("max_delta_step");
-      if (it != cfg_.end()) fo->Write(it->second);
+      auto it = cfg_.find("max_delta_step");
+      if (it != cfg_.end()) {
+        fo->Write(it->second);
+      } else {
+        // recover value of max_delta_step from extra attributes
+        auto it2 = attributes_.find("count_poisson_max_delta_step");
+        const std::string max_delta_step
+          = (it2 != attributes_.end()) ? it2->second : kMaxDeltaStepDefaultValue;
+        fo->Write(max_delta_step);
+      }
     }
-    if (mparam_.contain_eval_metrics != 0) {
+    if (mparam.contain_eval_metrics != 0) {
       std::vector<std::string> metr;
       for (auto& ev : metrics_) {
         metr.emplace_back(ev->Name());
@@ -344,19 +377,33 @@ class LearnerImpl : public Learner {
     }
   }
 
+  void CheckDataSplitMode() {
+    if (rabit::IsDistributed()) {
+      CHECK(tparam_.dsplit != DataSplitMode::kAuto)
+        << "Precondition violated; dsplit cannot be 'auto' in distributed mode";
+      if (tparam_.dsplit == DataSplitMode::kCol) {
+        // 'distcol' updater hidden until it becomes functional again
+        // See discussion at https://github.com/dmlc/xgboost/issues/1832
+        LOG(FATAL) << "Column-wise data split is currently not supported.";
+      }
+    }
+  }
+
   void UpdateOneIter(int iter, DMatrix* train) override {
     monitor_.Start("UpdateOneIter");
-    CHECK(ModelInitialized())
-        << "Always call InitModel or LoadModel before update";
+
     if (tparam_.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(tparam_.seed * kRandSeedMagic + iter);
     }
-    this->LazyInitDMatrix(train);
+    // this->PerformTreeMethodHeuristic(train);
+    this->CheckDataSplitMode();
+    this->ConfigurationWithKnownData(train);
+
     monitor_.Start("PredictRaw");
-    this->PredictRaw(train, &preds_);
+    this->PredictRaw(train, &preds_[train]);
     monitor_.Stop("PredictRaw");
     monitor_.Start("GetGradient");
-    obj_->GetGradient(&preds_, train->Info(), iter, &gpair_);
+    obj_->GetGradient(preds_[train], train->Info(), iter, &gpair_);
     monitor_.Stop("GetGradient");
     gbm_->DoBoost(train, &gpair_, obj_.get());
     monitor_.Stop("UpdateOneIter");
@@ -368,7 +415,10 @@ class LearnerImpl : public Learner {
     if (tparam_.seed_per_iteration || rabit::IsDistributed()) {
       common::GlobalRandom().seed(tparam_.seed * kRandSeedMagic + iter);
     }
-    this->LazyInitDMatrix(train);
+    this->CheckDataSplitMode();
+    // this->PerformTreeMethodHeuristic(train);
+    this->ConfigurationWithKnownData(train);
+
     gbm_->DoBoost(train, in_gpair);
     monitor_.Stop("BoostOneIter");
   }
@@ -376,17 +426,22 @@ class LearnerImpl : public Learner {
   std::string EvalOneIter(int iter, const std::vector<DMatrix*>& data_sets,
                           const std::vector<std::string>& data_names) override {
     monitor_.Start("EvalOneIter");
+
     std::ostringstream os;
     os << '[' << iter << ']' << std::setiosflags(std::ios::fixed);
-    if (metrics_.size() == 0) {
-      metrics_.emplace_back(Metric::Create(obj_->DefaultEvalMetric()));
+    if (metrics_.size() == 0 && tparam_.disable_default_eval_metric <= 0) {
+      metrics_.emplace_back(Metric::Create(obj_->DefaultEvalMetric(), &tparam_));
+      metrics_.back()->Configure(cfg_.begin(), cfg_.end());
     }
     for (size_t i = 0; i < data_sets.size(); ++i) {
-      this->PredictRaw(data_sets[i], &preds_);
-      obj_->EvalTransform(&preds_);
+      DMatrix * dmat = data_sets[i];
+      this->ConfigurationWithKnownData(dmat);
+      this->PredictRaw(data_sets[i], &preds_[dmat]);
+      obj_->EvalTransform(&preds_[dmat]);
       for (auto& ev : metrics_) {
         os << '\t' << data_names[i] << '-' << ev->Name() << ':'
-           << ev->Eval(preds_.HostVector(), data_sets[i]->Info(), tparam_.dsplit == 2);
+           << ev->Eval(preds_[dmat], data_sets[i]->Info(),
+                       tparam_.dsplit == DataSplitMode::kRow);
       }
     }
 
@@ -422,20 +477,30 @@ class LearnerImpl : public Learner {
     return out;
   }
 
+  LearnerTrainParam const& GetLearnerTrainParameter() const override {
+    return tparam_;
+  }
+
   std::pair<std::string, bst_float> Evaluate(DMatrix* data,
                                              std::string metric) {
     if (metric == "auto") metric = obj_->DefaultEvalMetric();
-    std::unique_ptr<Metric> ev(Metric::Create(metric.c_str()));
-    this->PredictRaw(data, &preds_);
-    obj_->EvalTransform(&preds_);
+    std::unique_ptr<Metric> ev(Metric::Create(metric.c_str(), &tparam_));
+    this->ConfigurationWithKnownData(data);
+    this->PredictRaw(data, &preds_[data]);
+    obj_->EvalTransform(&preds_[data]);
     return std::make_pair(metric,
-                          ev->Eval(preds_.HostVector(), data->Info(), tparam_.dsplit == 2));
+                          ev->Eval(preds_[data], data->Info(),
+                                   tparam_.dsplit == DataSplitMode::kRow));
   }
 
   void Predict(DMatrix* data, bool output_margin,
                HostDeviceVector<bst_float>* out_preds, unsigned ntree_limit,
                bool pred_leaf, bool pred_contribs, bool approx_contribs,
-               bool pred_interactions) const override {
+               bool pred_interactions) override {
+    int multiple_predictions = static_cast<int>(pred_leaf) +
+                               static_cast<int>(pred_interactions) +
+                               static_cast<int>(pred_contribs);
+    CHECK_LE(multiple_predictions, 1) << "Perform one kind of prediction at a time.";
     if (pred_contribs) {
       gbm_->PredictContribution(data, &out_preds->HostVector(), ntree_limit, approx_contribs);
     } else if (pred_interactions) {
@@ -451,86 +516,46 @@ class LearnerImpl : public Learner {
     }
   }
 
- protected:
-  // check if p_train is ready to used by training.
-  // if not, initialize the column access.
-  inline void LazyInitDMatrix(DMatrix* p_train) {
-    if (tparam_.tree_method == 3 || tparam_.tree_method == 4 ||
-        tparam_.tree_method == 5 || name_gbm_ == "gblinear") {
-      return;
-    }
-
-    monitor_.Start("LazyInitDMatrix");
-    if (!p_train->HaveColAccess(true)) {
-      auto ncol = static_cast<int>(p_train->Info().num_col_);
-      std::vector<bool> enabled(ncol, true);
-      // set max row per batch to limited value
-      // in distributed mode, use safe choice otherwise
-      size_t max_row_perbatch = tparam_.max_row_perbatch;
-      const auto safe_max_row = static_cast<size_t>(32ul << 10ul);
-
-      if (tparam_.tree_method == 0 && p_train->Info().num_row_ >= (4UL << 20UL)) {
-        LOG(CONSOLE)
-            << "Tree method is automatically selected to be \'approx\'"
-            << " for faster speed."
-            << " to use old behavior(exact greedy algorithm on single machine),"
-            << " set tree_method to \'exact\'";
-        max_row_perbatch = std::min(max_row_perbatch, safe_max_row);
-      }
-
-      if (tparam_.tree_method == 1) {
-        LOG(CONSOLE) << "Tree method is selected to be \'approx\'";
-        max_row_perbatch = std::min(max_row_perbatch, safe_max_row);
-      }
-
-      if (tparam_.test_flag == "block" || tparam_.dsplit == 2) {
-        max_row_perbatch = std::min(max_row_perbatch, safe_max_row);
-      }
-      // initialize column access
-      p_train->InitColAccess(max_row_perbatch, true);
-    }
-
-    if (!p_train->SingleColBlock() && cfg_.count("updater") == 0) {
-      if (tparam_.tree_method == 2) {
-        LOG(CONSOLE) << "tree method is set to be 'exact',"
-                     << " but currently we are only able to proceed with "
-                        "approximate algorithm";
-      }
-      cfg_["updater"] = "grow_histmaker,prune";
-      if (gbm_ != nullptr) {
-        gbm_->Configure(cfg_.begin(), cfg_.end());
-      }
-    }
-    monitor_.Stop("LazyInitDMatrix");
+  const std::map<std::string, std::string>& GetConfigurationArguments() const override {
+    return cfg_;
   }
 
+ protected:
   // return whether model is already initialized.
   inline bool ModelInitialized() const { return gbm_ != nullptr; }
-  // lazily initialize the model if it haven't yet been initialized.
+  // lazily initialize the model based on configuration if it haven't yet been initialized.
   inline void LazyInitModel() {
     if (this->ModelInitialized()) return;
     // estimate feature bound
+    // TODO(hcho3): Change num_feature to 64-bit integer
     unsigned num_feature = 0;
     for (auto & matrix : cache_) {
       CHECK(matrix != nullptr);
-      num_feature = std::max(num_feature,
-                             static_cast<unsigned>(matrix->Info().num_col_));
+      const uint64_t num_col = matrix->Info().num_col_;
+      CHECK_LE(num_col, static_cast<uint64_t>(std::numeric_limits<unsigned>::max()))
+        << "Unfortunately, XGBoost does not support data matrices with "
+        << std::numeric_limits<unsigned>::max() << " features or greater";
+      num_feature = std::max(num_feature, static_cast<unsigned>(num_col));
     }
     // run allreduce on num_feature to find the maximum value
     rabit::Allreduce<rabit::op::Max>(&num_feature, 1);
     if (num_feature > mparam_.num_feature) {
       mparam_.num_feature = num_feature;
     }
+    CHECK_NE(mparam_.num_feature, 0)
+        << "0 feature is supplied.  Are you using raw Booster interface?";
     // setup
     cfg_["num_feature"] = common::ToString(mparam_.num_feature);
     CHECK(obj_ == nullptr && gbm_ == nullptr);
-    obj_.reset(ObjFunction::Create(name_obj_));
+    obj_.reset(ObjFunction::Create(name_obj_, &tparam_));
     obj_->Configure(cfg_.begin(), cfg_.end());
     // reset the base score
     mparam_.base_score = obj_->ProbToMargin(mparam_.base_score);
-    gbm_.reset(GradientBooster::Create(name_gbm_, cache_, mparam_.base_score));
+    gbm_.reset(GradientBooster::Create(name_gbm_, &tparam_,
+                                       cache_, mparam_.base_score));
     gbm_->Configure(cfg_.begin(), cfg_.end());
   }
+
   /*!
    * \brief get un-transformed prediction
    * \param data training data matrix
@@ -538,17 +563,29 @@ class LearnerImpl : public Learner {
    * \param ntree_limit limit number of trees used for boosted tree
    *   predictor, when it equals 0, this means we are using all the trees
    */
-  inline void PredictRaw(DMatrix* data, HostDeviceVector<bst_float>* out_preds,
-                         unsigned ntree_limit = 0) const {
+  void PredictRaw(DMatrix* data, HostDeviceVector<bst_float>* out_preds,
+                  unsigned ntree_limit = 0) {
     CHECK(gbm_ != nullptr)
         << "Predict must happen after Load or InitModel";
+    ConfigurationWithKnownData(data);
     gbm_->PredictBatch(data, out_preds, ntree_limit);
+  }
+
+  void ValidateDMatrix(DMatrix* p_fmat) {
+    MetaInfo const& info = p_fmat->Info();
+    auto const& weights = info.weights_.HostVector();
+    if (info.group_ptr_.size() != 0 && weights.size() != 0) {
+      CHECK(weights.size() == info.group_ptr_.size() - 1)
+          << "\n"
+          << "weights size: " << weights.size()            << ", "
+          << "groups size: "  << info.group_ptr_.size() -1 << ", "
+          << "num rows: "     << p_fmat->Info().num_row_   << "\n"
+          << "Number of weights should be equal to number of groups in ranking task.";
+    }
   }
 
   // model parameter
   LearnerModelParam mparam_;
-  // training parameter
-  LearnerTrainParam tparam_;
   // configurations
   std::map<std::string, std::string> cfg_;
   // attributes
@@ -558,7 +595,7 @@ class LearnerImpl : public Learner {
   // name of objective function
   std::string name_obj_;
   // temporal storages for prediction
-  HostDeviceVector<bst_float> preds_;
+  std::map<DMatrix*, HostDeviceVector<bst_float>> preds_;
   // gradient pairs
   HostDeviceVector<GradientPair> gpair_;
 

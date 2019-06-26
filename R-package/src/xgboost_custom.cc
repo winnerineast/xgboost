@@ -3,7 +3,7 @@
 // to change behavior of libxgboost
 
 #include <xgboost/logging.h>
-#include "src/common/random.h"
+#include "../../src/common/random.h"
 #include "./xgboost_R.h"
 
 // redirect the messages to R's console.
@@ -32,7 +32,10 @@ extern "C" {
 
 namespace xgboost {
 ConsoleLogger::~ConsoleLogger() {
-  dmlc::CustomLogMessage::Log(log_stream_.str());
+  if (cur_verbosity_ == LogVerbosity::kIgnore ||
+      cur_verbosity_ <= global_verbosity_) {
+    dmlc::CustomLogMessage::Log(log_stream_.str());
+  }
 }
 TrackerLogger::~TrackerLogger() {
   dmlc::CustomLogMessage::Log(log_stream_.str());
@@ -46,10 +49,11 @@ namespace common {
 bool CheckNAN(double v) {
   return ISNAN(v);
 }
+#if !defined(XGBOOST_USE_CUDA)
 double LogGamma(double v) {
   return lgammafn(v);
 }
-
+#endif  // !defined(XGBOOST_USE_CUDA)
 // customize random engine.
 void CustomGlobalRandomEngine::seed(CustomGlobalRandomEngine::result_type val) {
   // ignore the seed

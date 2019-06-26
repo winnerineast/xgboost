@@ -2,18 +2,20 @@
 import numpy as np
 import xgboost as xgb
 import testing as tm
+
 import unittest
+import pytest
 
 try:
     import matplotlib
     matplotlib.use('Agg')
     from matplotlib.axes import Axes
-    from graphviz import Digraph
+    from graphviz import Source
 except ImportError:
     pass
 
 
-tm._skip_if_no_matplotlib()
+pytestmark = pytest.mark.skipif(**tm.no_matplotlib())
 
 
 dpath = 'demo/data/'
@@ -55,7 +57,7 @@ class TestPlotting(unittest.TestCase):
         assert ax.patches[3].get_facecolor() == (0, 0, 1.0, 1.0)  # blue
 
         g = xgb.to_graphviz(bst2, num_trees=0)
-        assert isinstance(g, Digraph)
+        assert isinstance(g, Source)
 
         ax = xgb.plot_tree(bst2, num_trees=0)
         assert isinstance(ax, Axes)

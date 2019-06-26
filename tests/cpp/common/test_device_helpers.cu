@@ -5,8 +5,21 @@
 #include <thrust/device_vector.h>
 #include <xgboost/base.h>
 #include "../../../src/common/device_helpers.cuh"
-#include "../../../src/common/timer.h"
+#include "../helpers.h"
 #include "gtest/gtest.h"
+
+using xgboost::common::Span;
+
+struct Shard { int id; };
+
+TEST(DeviceHelpers, Basic) {
+  std::vector<Shard> shards (4);
+  for (int i = 0; i < 4; ++i) {
+    shards[i].id = i;
+  }
+  int sum = dh::ReduceShards<int>(&shards, [](Shard& s) { return s.id ; });
+  ASSERT_EQ(sum, 6);
+}
 
 void CreateTestData(xgboost::bst_uint num_rows, int max_row_size,
                     thrust::host_vector<int> *row_ptr,
@@ -53,7 +66,9 @@ void TestLbs() {
   }
 }
 
-TEST(cub_lbs, Test) { TestLbs(); }
+TEST(cub_lbs, Test) {
+  TestLbs();
+}
 
 TEST(sumReduce, Test) {
   thrust::device_vector<float> data(100, 1.0f);
@@ -61,3 +76,41 @@ TEST(sumReduce, Test) {
   auto sum = dh::SumReduction(temp, dh::Raw(data), data.size());
   ASSERT_NEAR(sum, 100.0f, 1e-5);
 }
+
+void TestAllocator() {
+  int n = 10;
+  Span<float> a;
+  Span<int> b;
+  Span<size_t> c;
+  dh::BulkAllocator ba;
+  ba.Allocate(0, &a, n, &b, n, &c, n);
+
+  // Should be no illegal memory accesses
+  dh::LaunchN(0, n, [=] __device__(size_t idx) { c[idx] = a[idx] + b[idx]; });
+
+  dh::safe_cuda(cudaDeviceSynchronize());
+}
+
+// Define the test in a function so we can use device lambda
+TEST(bulkAllocator, Test) {
+  TestAllocator();
+}
+
+ // Test thread safe max reduction
+#if defined(XGBOOST_USE_NCCL)
+TEST(AllReducer, MGPU_HostMaxAllReduce) {
+  dh::AllReducer reducer;
+  size_t num_threads = 50;
+  std::vector<std::vector<size_t>> thread_data(num_threads);
+#pragma omp parallel num_threads(num_threads)
+  {
+    int tid = omp_get_thread_num();
+    thread_data[tid] = {size_t(tid)};
+    reducer.HostMaxAllReduce(&thread_data[tid]);
+  }
+
+  for (auto data : thread_data) {
+    ASSERT_EQ(data.front(), num_threads - 1);
+  }
+}
+#endif

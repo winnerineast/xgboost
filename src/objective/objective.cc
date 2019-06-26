@@ -14,7 +14,7 @@ DMLC_REGISTRY_ENABLE(::xgboost::ObjFunctionReg);
 
 namespace xgboost {
 // implement factory functions
-ObjFunction* ObjFunction::Create(const std::string& name) {
+ObjFunction* ObjFunction::Create(const std::string& name, LearnerTrainParam const* tparam) {
   auto *e = ::dmlc::Registry< ::xgboost::ObjFunctionReg>::Get()->Find(name);
   if (e == nullptr) {
     for (const auto& entry : ::dmlc::Registry< ::xgboost::ObjFunctionReg>::List()) {
@@ -22,7 +22,9 @@ ObjFunction* ObjFunction::Create(const std::string& name) {
     }
     LOG(FATAL) << "Unknown objective function " << name;
   }
-  return (e->body)();
+  auto pobj = (e->body)();
+  pobj->tparam_ = tparam;
+  return pobj;
 }
 
 }  // namespace xgboost
@@ -30,11 +32,15 @@ ObjFunction* ObjFunction::Create(const std::string& name) {
 namespace xgboost {
 namespace obj {
 // List of files that will be force linked in static links.
-DMLC_REGISTRY_LINK_TAG(regression_obj);
 #ifdef XGBOOST_USE_CUDA
-  DMLC_REGISTRY_LINK_TAG(regression_obj_gpu);
-#endif
+DMLC_REGISTRY_LINK_TAG(regression_obj_gpu);
+DMLC_REGISTRY_LINK_TAG(hinge_obj_gpu);
+DMLC_REGISTRY_LINK_TAG(multiclass_obj_gpu);
+#else
+DMLC_REGISTRY_LINK_TAG(regression_obj);
+DMLC_REGISTRY_LINK_TAG(hinge_obj);
 DMLC_REGISTRY_LINK_TAG(multiclass_obj);
+#endif  // XGBOOST_USE_CUDA
 DMLC_REGISTRY_LINK_TAG(rank_obj);
 }  // namespace obj
 }  // namespace xgboost

@@ -119,6 +119,7 @@ If you have particular usecase of xgboost that you would like to highlight.
 Send a PR to add a one sentence description:)
 
 - XGBoost is used in [Kaggle Script](https://www.kaggle.com/scripts) to solve data science challenges.
+- Distribute XGBoost as Rest API server from Jupyter notebook with [BentoML](https://github.com/bentoml/bentoml). [Link to notebook](https://github.com/bentoml/BentoML/blob/master/examples/xgboost-predict-titanic-survival/XGBoost-titanic-survival-prediction.ipynb)
 - [Seldon predictive service powered by XGBoost](http://docs.seldon.io/iris-demo.html)
 - XGBoost Distributed is used in [ODPS Cloud Service by Alibaba](https://yq.aliyun.com/articles/6355) (in Chinese)
 - XGBoost is incoporated as part of [Graphlab Create](https://dato.com/products/create/) for scalable machine learning.
@@ -135,6 +136,7 @@ Send a PR to add a one sentence description:)
 
 ## Awards
 - [John Chambers Award](http://stat-computing.org/awards/jmc/winners.html) - 2016 Winner: XGBoost R Package, by Tong He (Simon Fraser University) and Tianqi Chen (University of Washington)
+- [InfoWorld’s 2019 Technology of the Year Award](https://www.infoworld.com/article/3336072/application-development/infoworlds-2019-technology-of-the-year-award-winners.html)
 
 ## Windows Binaries
 Unofficial windows binaries and instructions on how to use them are hosted on [Guido Tapia's blog](http://www.picnet.com.au/blogs/guido/post/2016/09/22/xgboost-windows-x64-binaries-for-download/)

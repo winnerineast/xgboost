@@ -49,7 +49,7 @@ def _train_internal(params, dtrain,
 
     # Distributed code: Load the checkpoint from rabit.
     version = bst.load_rabit_checkpoint()
-    assert(rabit.get_world_size() != 1 or version == 0)
+    assert rabit.get_world_size() != 1 or version == 0
     rank = rabit.get_rank()
     start_iteration = int(version / 2)
     nboost += start_iteration
@@ -75,12 +75,12 @@ def _train_internal(params, dtrain,
             bst.save_rabit_checkpoint()
             version += 1
 
-        assert(rabit.get_world_size() == 1 or version == rabit.version_number())
+        assert rabit.get_world_size() == 1 or version == rabit.version_number()
 
         nboost += 1
         evaluation_result_list = []
         # check evaluation result.
-        if len(evals) != 0:
+        if evals:
             bst_eval_set = bst.eval_set(evals, i, feval)
             if isinstance(bst_eval_set, STRING_TYPES):
                 msg = bst_eval_set
@@ -137,28 +137,35 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None,
         Whether to maximize feval.
     early_stopping_rounds: int
         Activates early stopping. Validation error needs to decrease at least
-        every <early_stopping_rounds> round(s) to continue training.
-        Requires at least one item in evals.
+        every **early_stopping_rounds** round(s) to continue training.
+        Requires at least one item in **evals**.
         If there's more than one, will use the last.
         Returns the model from the last iteration (not the best one).
         If early stopping occurs, the model will have three additional fields:
-        bst.best_score, bst.best_iteration and bst.best_ntree_limit.
-        (Use bst.best_ntree_limit to get the correct value if num_parallel_tree
-        and/or num_class appears in the parameters)
+        ``bst.best_score``, ``bst.best_iteration`` and ``bst.best_ntree_limit``.
+        (Use ``bst.best_ntree_limit`` to get the correct value if
+        ``num_parallel_tree`` and/or ``num_class`` appears in the parameters)
     evals_result: dict
         This dictionary stores the evaluation results of all the items in watchlist.
-        Example: with a watchlist containing [(dtest,'eval'), (dtrain,'train')] and
-        a parameter containing ('eval_metric': 'logloss')
-        Returns: {'train': {'logloss': ['0.48253', '0.35953']},
-                  'eval': {'logloss': ['0.480385', '0.357756']}}
+
+        Example: with a watchlist containing
+        ``[(dtest,'eval'), (dtrain,'train')]`` and
+        a parameter containing ``('eval_metric': 'logloss')``,
+        the **evals_result** returns
+
+        .. code-block:: python
+
+            {'train': {'logloss': ['0.48253', '0.35953']},
+             'eval': {'logloss': ['0.480385', '0.357756']}}
+
     verbose_eval : bool or int
-        Requires at least one item in evals.
-        If `verbose_eval` is True then the evaluation metric on the validation set is
+        Requires at least one item in **evals**.
+        If **verbose_eval** is True then the evaluation metric on the validation set is
         printed at each boosting stage.
-        If `verbose_eval` is an integer then the evaluation metric on the validation set
-        is printed at every given `verbose_eval` boosting stage. The last boosting stage
-        / the boosting stage found by using `early_stopping_rounds` is also printed.
-        Example: with verbose_eval=4 and at least one item in evals, an evaluation metric
+        If **verbose_eval** is an integer then the evaluation metric on the validation set
+        is printed at every given **verbose_eval** boosting stage. The last boosting stage
+        / the boosting stage found by using **early_stopping_rounds** is also printed.
+        Example: with ``verbose_eval=4`` and at least one item in **evals**, an evaluation metric
         is printed every 4 boosting stages, instead of every boosting stage.
     learning_rates: list or function (deprecated - use callback API instead)
         List of learning rate for each boosting round
@@ -169,12 +176,17 @@ def train(params, dtrain, num_boost_round=10, evals=(), obj=None, feval=None,
         Xgb model to be loaded before training (allows training continuation).
     callbacks : list of callback functions
         List of callback functions that are applied at end of each iteration.
-        It is possible to use predefined callbacks by using xgb.callback module.
-        Example: [xgb.callback.reset_learning_rate(custom_rates)]
+        It is possible to use predefined callbacks by using
+        :ref:`Callback API <callback_api>`.
+        Example:
+
+        .. code-block:: python
+
+            [xgb.callback.reset_learning_rate(custom_rates)]
 
     Returns
     -------
-    booster : a trained booster model
+    Booster : a trained booster model
     """
     callbacks = [] if callbacks is None else callbacks
 
@@ -222,6 +234,56 @@ class CVPack(object):
         return self.bst.eval_set(self.watchlist, iteration, feval)
 
 
+def groups_to_rows(groups, boundaries):
+    """
+    Given group row boundaries, convert ground indexes to row indexes
+    :param groups: list of groups for testing
+    :param boundaries: rows index limits of each group
+    :return: row in group
+    """
+    return np.concatenate([np.arange(boundaries[g], boundaries[g+1]) for g in groups])
+
+
+def mkgroupfold(dall, nfold, param, evals=(), fpreproc=None, shuffle=True):
+    """
+    Make n folds for cross-validation maintaining groups
+    :return: cross-validation folds
+    """
+    # we have groups for pairwise ranking... get a list of the group indexes
+    group_boundaries = dall.get_uint_info('group_ptr')
+    group_sizes = np.diff(group_boundaries)
+
+    if shuffle is True:
+        idx = np.random.permutation(len(group_sizes))
+    else:
+        idx = np.arange(len(group_sizes))
+    # list by fold of test group indexes
+    out_group_idset = np.array_split(idx, nfold)
+    # list by fold of train group indexes
+    in_group_idset = [np.concatenate([out_group_idset[i] for i in range(nfold) if k != i])
+                      for k in range(nfold)]
+    # from the group indexes, convert them to row indexes
+    in_idset = [groups_to_rows(in_groups, group_boundaries) for in_groups in in_group_idset]
+    out_idset = [groups_to_rows(out_groups, group_boundaries) for out_groups in out_group_idset]
+
+    # build the folds by taking the appropriate slices
+    ret = []
+    for k in range(nfold):
+        # perform the slicing using the indexes determined by the above methods
+        dtrain = dall.slice(in_idset[k], allow_groups=True)
+        dtrain.set_group(group_sizes[in_group_idset[k]])
+        dtest = dall.slice(out_idset[k], allow_groups=True)
+        dtest.set_group(group_sizes[out_group_idset[k]])
+        # run preprocessing on the data set if needed
+        if fpreproc is not None:
+            dtrain, dtest, tparam = fpreproc(dtrain, dtest, param.copy())
+        else:
+            tparam = param
+        plst = list(tparam.items()) + [('eval_metric', itm) for itm in evals]
+        ret.append(CVPack(dtrain, dtest, plst))
+    return ret
+
+
 def mknfold(dall, nfold, param, seed, evals=(), fpreproc=None, stratified=False,
             folds=None, shuffle=True):
     """
@@ -231,16 +293,17 @@ def mknfold(dall, nfold, param, seed, evals=(), fpreproc=None, stratified=False,
     np.random.seed(seed)
 
     if stratified is False and folds is None:
-        # Do standard k-fold cross validation
+        # Do standard k-fold cross validation. Automatically determine the folds.
+        if len(dall.get_uint_info('group_ptr')) > 1:
+            return mkgroupfold(dall, nfold, param, evals=evals, fpreproc=fpreproc, shuffle=shuffle)
+
         if shuffle is True:
             idx = np.random.permutation(dall.num_row())
         else:
             idx = np.arange(dall.num_row())
         out_idset = np.array_split(idx, nfold)
-        in_idset = [
-            np.concatenate([out_idset[i] for i in range(nfold) if k != i])
-            for k in range(nfold)
-        ]
+        in_idset = [np.concatenate([out_idset[i] for i in range(nfold) if k != i])
+                    for k in range(nfold)]
     elif folds is not None:
         # Use user specified custom split using indices
         try:
@@ -262,6 +325,7 @@ def mknfold(dall, nfold, param, seed, evals=(), fpreproc=None, stratified=False,
 
     ret = []
     for k in range(nfold):
+        # perform the slicing using the indexes determined by the above methods
         dtrain = dall.slice(in_idset[k])
         dtest = dall.slice(out_idset[k])
         # run preprocessing on the data set if needed
@@ -328,10 +392,10 @@ def cv(params, dtrain, num_boost_round=10, nfold=3, stratified=False, folds=None
     folds : a KFold or StratifiedKFold instance or list of fold indices
         Sklearn KFolds or StratifiedKFolds object.
         Alternatively may explicitly pass sample indices for each fold.
-        For `n` folds, `folds` should be a length `n` list of tuples.
-        Each tuple is `(in,out)` where `in` is a list of indices to be used
-        as the training samples for the `n`th fold and `out` is a list of
-        indices to be used as the testing samples for the `n`th fold.
+        For ``n`` folds, **folds** should be a length ``n`` list of tuples.
+        Each tuple is ``(in,out)`` where ``in`` is a list of indices to be used
+        as the training samples for the ``n`` th fold and ``out`` is a list of
+        indices to be used as the testing samples for the ``n`` th fold.
     metrics : string or list of strings
         Evaluation metrics to be watched in CV.
     obj : function
@@ -362,9 +426,14 @@ def cv(params, dtrain, num_boost_round=10, nfold=3, stratified=False, folds=None
         Seed used to generate the folds (passed to numpy.random.seed).
     callbacks : list of callback functions
         List of callback functions that are applied at end of each iteration.
-        It is possible to use predefined callbacks by using xgb.callback module.
-        Example: [xgb.callback.reset_learning_rate(custom_rates)]
-     shuffle : bool
+        It is possible to use predefined callbacks by using
+        :ref:`Callback API <callback_api>`.
+        Example:
+
+        .. code-block:: python
+
+            [xgb.callback.reset_learning_rate(custom_rates)]
+    shuffle : bool
         Shuffle data before creating folds.
 
     Returns
@@ -385,7 +454,7 @@ def cv(params, dtrain, num_boost_round=10, nfold=3, stratified=False, folds=None
     else:
         params = dict((k, v) for k, v in params.items())
 
-    if len(metrics) == 0 and 'eval_metric' in params:
+    if (not metrics) and 'eval_metric' in params:
         if isinstance(params['eval_metric'], list):
             metrics = params['eval_metric']
         else:
@@ -445,7 +514,7 @@ def cv(params, dtrain, num_boost_round=10, nfold=3, stratified=False, folds=None
                                rank=0,
                                evaluation_result_list=res))
         except EarlyStopException as e:
-            for k in results.keys():
+            for k in results:
                 results[k] = results[k][:(e.best_iteration + 1)]
             break
     if as_pandas:

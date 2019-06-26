@@ -16,30 +16,30 @@
 
 package ml.dmlc.xgboost4j.scala.spark
 
-import scala.collection.Iterator
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-
 import ml.dmlc.xgboost4j.java.Rabit
-import ml.dmlc.xgboost4j.scala.{Booster, DMatrix, XGBoost => SXGBoost}
 import ml.dmlc.xgboost4j.scala.spark.params._
+import ml.dmlc.xgboost4j.scala.{Booster, DMatrix, EvalTrait, ObjectiveTrait, XGBoost => SXGBoost}
 import ml.dmlc.xgboost4j.{LabeledPoint => XGBLabeledPoint}
-
 import org.apache.hadoop.fs.Path
 import org.apache.spark.TaskContext
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.classification._
 import org.apache.spark.ml.linalg._
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared.HasWeightCol
 import org.apache.spark.ml.util._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
-import org.apache.spark.sql._
 import org.json4s.DefaultFormats
+
+import scala.collection.JavaConverters._
+import scala.collection.{AbstractIterator, Iterator, mutable}
 
 private[spark] trait XGBoostClassifierParams extends GeneralParams with LearningTaskParams
   with BoosterParams with HasWeightCol with HasBaseMarginCol with HasNumClass with ParamMapFuncs
+  with HasLeafPredictionCol with HasContribPredictionCol with NonParamVariables
 
 class XGBoostClassifier (
     override val uid: String,
@@ -109,6 +109,8 @@ class XGBoostClassifier (
 
   def setMaxBins(value: Int): this.type = set(maxBins, value)
 
+  def setMaxLeaves(value: Int): this.type = set(maxLeaves, value)
+
   def setSketchEps(value: Double): this.type = set(sketchEps, value)
 
   def setScalePosWeight(value: Double): this.type = set(scalePosWeight, value)
@@ -126,6 +128,8 @@ class XGBoostClassifier (
   // setters for learning params
   def setObjective(value: String): this.type = set(objective, value)
 
+  def setObjectiveType(value: String): this.type = set(objectiveType, value)
+
   def setBaseScore(value: Double): this.type = set(baseScore, value)
 
   def setEvalMetric(value: String): this.type = set(evalMetric, value)
@@ -133,6 +137,13 @@ class XGBoostClassifier (
   def setTrainTestRatio(value: Double): this.type = set(trainTestRatio, value)
 
   def setNumEarlyStoppingRounds(value: Int): this.type = set(numEarlyStoppingRounds, value)
+
+  def setMaximizeEvaluationMetrics(value: Boolean): this.type =
+    set(maximizeEvaluationMetrics, value)
+
+  def setCustomObj(value: ObjectiveTrait): this.type = set(customObj, value)
+
+  def setCustomEval(value: EvalTrait): this.type = set(customEval, value)
 
   // called at the start of fit/train when 'eval_metric' is not defined
   private def setupDefaultEvalMetric(): String = {
@@ -152,6 +163,10 @@ class XGBoostClassifier (
       set(evalMetric, setupDefaultEvalMetric())
     }
 
+    if (isDefined(customObj) && $(customObj) != null) {
+      set(objectiveType, "classification")
+    }
+
     val _numClasses = getNumClasses(dataset)
     if (isDefined(numClass) && $(numClass) != _numClasses) {
       throw new Exception("The number of classes in dataset doesn't match " +
@@ -165,24 +180,19 @@ class XGBoostClassifier (
       col($(baseMarginCol))
     }
 
-    val instances: RDD[XGBLabeledPoint] = dataset.select(
-      col($(featuresCol)),
-      col($(labelCol)).cast(FloatType),
-      baseMargin.cast(FloatType),
-      weight.cast(FloatType)
-    ).rdd.map { case Row(features: Vector, label: Float, baseMargin: Float, weight: Float) =>
-      val (indices, values) = features match {
-        case v: SparseVector => (v.indices, v.values.map(_.toFloat))
-        case v: DenseVector => (null, v.values.map(_.toFloat))
-      }
-      XGBLabeledPoint(label, indices, values, baseMargin = baseMargin, weight = weight)
+    val trainingSet: RDD[XGBLabeledPoint] = DataUtils.convertDataFrameToXGBLabeledPointRDDs(
+      col($(labelCol)), col($(featuresCol)), weight, baseMargin,
+      None, dataset.asInstanceOf[DataFrame]).head
+    val evalRDDMap = getEvalSets(xgboostParams).map {
+      case (name, dataFrame) => (name,
+        DataUtils.convertDataFrameToXGBLabeledPointRDDs(col($(labelCol)), col($(featuresCol)),
+          weight, baseMargin, None, dataFrame).head)
     }
     transformSchema(dataset.schema, logging = true)
     val derivedXGBParamMap = MLlib2XGBoostParams
     // All non-null param maps in XGBoostClassifier are in derivedXGBParamMap.
-    val (_booster, _metrics) = XGBoost.trainDistributed(instances, derivedXGBParamMap,
-      $(numRound), $(numWorkers), $(customObj), $(customEval), $(useExternalMemory),
-      $(missing))
+    val (_booster, _metrics) = XGBoost.trainDistributed(trainingSet, derivedXGBParamMap,
+      hasGroup = false, evalRDDMap)
     val model = new XGBoostClassificationModel(uid, _numClasses, _booster)
     val summary = XGBoostTrainingSummary(_metrics)
     model.setSummary(summary)
@@ -202,7 +212,8 @@ class XGBoostClassificationModel private[ml](
     override val numClasses: Int,
     private[spark] val _booster: Booster)
   extends ProbabilisticClassificationModel[Vector, XGBoostClassificationModel]
-    with XGBoostClassifierParams with MLWritable with Serializable {
+    with XGBoostClassifierParams with InferenceParams
+    with MLWritable with Serializable {
 
   import XGBoostClassificationModel._
 
@@ -230,18 +241,26 @@ class XGBoostClassificationModel private[ml](
     this
   }
 
+  def setLeafPredictionCol(value: String): this.type = set(leafPredictionCol, value)
+
+  def setContribPredictionCol(value: String): this.type = set(contribPredictionCol, value)
+
+  def setTreeLimit(value: Int): this.type = set(treeLimit, value)
+
+  def setInferBatchSize(value: Int): this.type = set(inferBatchSize, value)
+
   /**
    * Single instance prediction.
    * Note: The performance is not ideal, use it carefully!
    */
   override def predict(features: Vector): Double = {
     import DataUtils._
-    val dm = new DMatrix(Iterator(features.asXGB))
-    val probability = _booster.predict(data = dm)(0)
+    val dm = new DMatrix(XGBoost.processMissingValues(Iterator(features.asXGB), $(missing)))
+    val probability = _booster.predict(data = dm)(0).map(_.toDouble)
     if (numClasses == 2) {
       math.round(probability(0))
     } else {
-      Vectors.dense(probability.map(_.toDouble)).argmax
+      probability2prediction(Vectors.dense(probability))
     }
   }
 
@@ -267,46 +286,131 @@ class XGBoostClassificationModel private[ml](
     val bBooster = dataset.sparkSession.sparkContext.broadcast(_booster)
     val appName = dataset.sparkSession.sparkContext.appName
 
-    val rdd = dataset.rdd.mapPartitions { rowIterator =>
-      if (rowIterator.hasNext) {
-        val rabitEnv = Array("DMLC_TASK_ID" -> TaskContext.getPartitionId().toString).toMap
-        Rabit.init(rabitEnv.asJava)
-        val (rowItr1, rowItr2) = rowIterator.duplicate
-        val featuresIterator = rowItr2.map(row => row.asInstanceOf[Row].getAs[Vector](
-          $(featuresCol))).toList.iterator
-        import DataUtils._
-        val cacheInfo = {
-          if ($(useExternalMemory)) {
-            s"$appName-${TaskContext.get().stageId()}-dtest_cache-${TaskContext.getPartitionId()}"
-          } else {
-            null
+    val resultRDD = dataset.asInstanceOf[Dataset[Row]].rdd.mapPartitions { rowIterator =>
+      new AbstractIterator[Row] {
+        private var batchCnt = 0
+
+        private val batchIterImpl = rowIterator.grouped($(inferBatchSize)).flatMap { batchRow =>
+          if (batchCnt == 0) {
+            val rabitEnv = Array("DMLC_TASK_ID" -> TaskContext.getPartitionId().toString).toMap
+            Rabit.init(rabitEnv.asJava)
+          }
+
+          val features = batchRow.iterator.map(row => row.getAs[Vector]($(featuresCol)))
+
+          import DataUtils._
+          val cacheInfo = {
+            if ($(useExternalMemory)) {
+              s"$appName-${TaskContext.get().stageId()}-dtest_cache-" +
+                  s"${TaskContext.getPartitionId()}-batch-$batchCnt"
+            } else {
+              null
+            }
+          }
+
+          val dm = new DMatrix(
+            XGBoost.processMissingValues(features.map(_.asXGB), $(missing)),
+            cacheInfo)
+          try {
+            val Array(rawPredictionItr, probabilityItr, predLeafItr, predContribItr) =
+              producePredictionItrs(bBooster, dm)
+            produceResultIterator(batchRow.iterator,
+              rawPredictionItr, probabilityItr, predLeafItr, predContribItr)
+          } finally {
+            batchCnt += 1
+            dm.delete()
           }
         }
 
-        val dm = new DMatrix(featuresIterator.map(_.asXGB), cacheInfo)
-        try {
-          val rawPredictionItr = {
-            bBooster.value.predict(dm, outPutMargin = true).map(Row(_)).iterator
+        override def hasNext: Boolean = batchIterImpl.hasNext
+
+        override def next(): Row = {
+          val ret = batchIterImpl.next()
+          if (!batchIterImpl.hasNext) {
+            Rabit.shutdown()
           }
-          val probabilityItr = {
-            bBooster.value.predict(dm, outPutMargin = false).map(Row(_)).iterator
-          }
-          Rabit.shutdown()
-          rowItr1.zip(rawPredictionItr).zip(probabilityItr).map {
-            case ((originals: Row, rawPrediction: Row), probability: Row) =>
-              Row.fromSeq(originals.toSeq ++ rawPrediction.toSeq ++ probability.toSeq)
-          }
-        } finally {
-          dm.delete()
+          ret
         }
-      } else {
-        Iterator[Row]()
       }
     }
 
     bBooster.unpersist(blocking = false)
+    dataset.sparkSession.createDataFrame(resultRDD, generateResultSchema(schema))
+  }
 
-    dataset.sparkSession.createDataFrame(rdd, schema)
+  private def produceResultIterator(
+      originalRowItr: Iterator[Row],
+      rawPredictionItr: Iterator[Row],
+      probabilityItr: Iterator[Row],
+      predLeafItr: Iterator[Row],
+      predContribItr: Iterator[Row]): Iterator[Row] = {
+    // the following implementation is to be improved
+    if (isDefined(leafPredictionCol) && $(leafPredictionCol).nonEmpty &&
+      isDefined(contribPredictionCol) && $(contribPredictionCol).nonEmpty) {
+      originalRowItr.zip(rawPredictionItr).zip(probabilityItr).zip(predLeafItr).zip(predContribItr).
+        map { case ((((originals: Row, rawPrediction: Row), probability: Row), leaves: Row),
+        contribs: Row) =>
+          Row.fromSeq(originals.toSeq ++ rawPrediction.toSeq ++ probability.toSeq ++ leaves.toSeq ++
+            contribs.toSeq)
+      }
+    } else if (isDefined(leafPredictionCol) && $(leafPredictionCol).nonEmpty &&
+      (!isDefined(contribPredictionCol) || $(contribPredictionCol).isEmpty)) {
+      originalRowItr.zip(rawPredictionItr).zip(probabilityItr).zip(predLeafItr).
+        map { case (((originals: Row, rawPrediction: Row), probability: Row), leaves: Row) =>
+          Row.fromSeq(originals.toSeq ++ rawPrediction.toSeq ++ probability.toSeq ++ leaves.toSeq)
+        }
+    } else if ((!isDefined(leafPredictionCol) || $(leafPredictionCol).isEmpty) &&
+      isDefined(contribPredictionCol) && $(contribPredictionCol).nonEmpty) {
+      originalRowItr.zip(rawPredictionItr).zip(probabilityItr).zip(predContribItr).
+        map { case (((originals: Row, rawPrediction: Row), probability: Row), contribs: Row) =>
+          Row.fromSeq(originals.toSeq ++ rawPrediction.toSeq ++ probability.toSeq ++ contribs.toSeq)
+        }
+    } else {
+      originalRowItr.zip(rawPredictionItr).zip(probabilityItr).map {
+        case ((originals: Row, rawPrediction: Row), probability: Row) =>
+          Row.fromSeq(originals.toSeq ++ rawPrediction.toSeq ++ probability.toSeq)
+      }
+    }
+  }
+
+  private def generateResultSchema(fixedSchema: StructType): StructType = {
+    var resultSchema = fixedSchema
+    if (isDefined(leafPredictionCol)) {
+      resultSchema = resultSchema.add(StructField(name = $(leafPredictionCol), dataType =
+        ArrayType(FloatType, containsNull = false), nullable = false))
+    }
+    if (isDefined(contribPredictionCol)) {
+      resultSchema = resultSchema.add(StructField(name = $(contribPredictionCol), dataType =
+        ArrayType(FloatType, containsNull = false), nullable = false))
+    }
+    resultSchema
+  }
+
+  private def producePredictionItrs(broadcastBooster: Broadcast[Booster], dm: DMatrix):
+      Array[Iterator[Row]] = {
+    val rawPredictionItr = {
+      broadcastBooster.value.predict(dm, outPutMargin = true, $(treeLimit)).
+        map(Row(_)).iterator
+    }
+    val probabilityItr = {
+      broadcastBooster.value.predict(dm, outPutMargin = false, $(treeLimit)).
+        map(Row(_)).iterator
+    }
+    val predLeafItr = {
+      if (isDefined(leafPredictionCol)) {
+        broadcastBooster.value.predictLeaf(dm, $(treeLimit)).map(Row(_)).iterator
+      } else {
+        Iterator()
+      }
+    }
+    val predContribItr = {
+      if (isDefined(contribPredictionCol)) {
+        broadcastBooster.value.predictContrib(dm, $(treeLimit)).map(Row(_)).iterator
+      } else {
+        Iterator()
+      }
+    }
+    Array(rawPredictionItr, probabilityItr, predLeafItr, predContribItr)
   }
 
   override def transform(dataset: Dataset[_]): DataFrame = {
@@ -322,25 +426,22 @@ class XGBoostClassificationModel private[ml](
     var outputData = transformInternal(dataset)
     var numColsOutput = 0
 
-    val rawPredictionUDF = udf { (rawPrediction: mutable.WrappedArray[Float]) =>
-      Vectors.dense(rawPrediction.map(_.toDouble).toArray)
+    val rawPredictionUDF = udf { rawPrediction: mutable.WrappedArray[Float] =>
+      val raw = rawPrediction.map(_.toDouble).toArray
+      val rawPredictions = if (numClasses == 2) Array(-raw(0), raw(0)) else raw
+      Vectors.dense(rawPredictions)
     }
 
-    val probabilityUDF = udf { (probability: mutable.WrappedArray[Float]) =>
-      if (numClasses == 2) {
-        Vectors.dense(Array(1 - probability(0), probability(0)).map(_.toDouble))
-      } else {
-        Vectors.dense(probability.map(_.toDouble).toArray)
-      }
+    val probabilityUDF = udf { probability: mutable.WrappedArray[Float] =>
+      val prob = probability.map(_.toDouble).toArray
+      val probabilities = if (numClasses == 2) Array(1.0 - prob(0), prob(0)) else prob
+      Vectors.dense(probabilities)
     }
 
-    val predictUDF = udf { (probability: mutable.WrappedArray[Float]) =>
+    val predictUDF = udf { probability: mutable.WrappedArray[Float] =>
       // From XGBoost probability to MLlib prediction
-      val probabilities = if (numClasses == 2) {
-        Array(1 - probability(0), probability(0)).map(_.toDouble)
-      } else {
-        probability.map(_.toDouble).toArray
-      }
+      val prob = probability.map(_.toDouble).toArray
+      val probabilities = if (numClasses == 2) Array(1.0 - prob(0), prob(0)) else prob
       probability2prediction(Vectors.dense(probabilities))
     }
 

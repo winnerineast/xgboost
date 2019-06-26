@@ -15,7 +15,7 @@
 #if DMLC_ENABLE_STD_THREAD
 #include "./sparse_page_source.h"
 #include "./sparse_page_dmatrix.h"
-#endif
+#endif  // DMLC_ENABLE_STD_THREAD
 
 namespace dmlc {
 DMLC_REGISTRY_ENABLE(::xgboost::data::SparsePageFormatReg);
@@ -25,12 +25,12 @@ namespace xgboost {
 // implementation of inline functions
 void MetaInfo::Clear() {
   num_row_ = num_col_ = num_nonzero_ = 0;
-  labels_.clear();
+  labels_.HostVector().clear();
   root_index_.clear();
   group_ptr_.clear();
   qids_.clear();
-  weights_.clear();
-  base_margin_.clear();
+  weights_.HostVector().clear();
+  base_margin_.HostVector().clear();
 }
 
 void MetaInfo::SaveBinary(dmlc::Stream *fo) const {
@@ -39,12 +39,12 @@ void MetaInfo::SaveBinary(dmlc::Stream *fo) const {
   fo->Write(&num_row_, sizeof(num_row_));
   fo->Write(&num_col_, sizeof(num_col_));
   fo->Write(&num_nonzero_, sizeof(num_nonzero_));
-  fo->Write(labels_);
+  fo->Write(labels_.HostVector());
   fo->Write(group_ptr_);
   fo->Write(qids_);
-  fo->Write(weights_);
+  fo->Write(weights_.HostVector());
   fo->Write(root_index_);
-  fo->Write(base_margin_);
+  fo->Write(base_margin_.HostVector());
 }
 
 void MetaInfo::LoadBinary(dmlc::Stream *fi) {
@@ -55,16 +55,16 @@ void MetaInfo::LoadBinary(dmlc::Stream *fi) {
   CHECK(fi->Read(&num_col_, sizeof(num_col_)) == sizeof(num_col_)) << "MetaInfo: invalid format";
   CHECK(fi->Read(&num_nonzero_, sizeof(num_nonzero_)) == sizeof(num_nonzero_))
       << "MetaInfo: invalid format";
-  CHECK(fi->Read(&labels_)) <<  "MetaInfo: invalid format";
+  CHECK(fi->Read(&labels_.HostVector())) <<  "MetaInfo: invalid format";
   CHECK(fi->Read(&group_ptr_)) << "MetaInfo: invalid format";
   if (version >= kVersionQidAdded) {
     CHECK(fi->Read(&qids_)) << "MetaInfo: invalid format";
   } else {  // old format doesn't contain qid field
     qids_.clear();
   }
-  CHECK(fi->Read(&weights_)) << "MetaInfo: invalid format";
+  CHECK(fi->Read(&weights_.HostVector())) << "MetaInfo: invalid format";
   CHECK(fi->Read(&root_index_)) << "MetaInfo: invalid format";
-  CHECK(fi->Read(&base_margin_)) << "MetaInfo: invalid format";
+  CHECK(fi->Read(&base_margin_.HostVector())) << "MetaInfo: invalid format";
 }
 
 // try to load group information from file, if exists
@@ -121,17 +121,20 @@ void MetaInfo::SetInfo(const char* key, const void* dptr, DataType dtype, size_t
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
                        std::copy(cast_dptr, cast_dptr + num, root_index_.begin()));
   } else if (!std::strcmp(key, "label")) {
-    labels_.resize(num);
+    auto& labels = labels_.HostVector();
+    labels.resize(num);
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
-                       std::copy(cast_dptr, cast_dptr + num, labels_.begin()));
+                       std::copy(cast_dptr, cast_dptr + num, labels.begin()));
   } else if (!std::strcmp(key, "weight")) {
-    weights_.resize(num);
+    auto& weights = weights_.HostVector();
+    weights.resize(num);
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
-                       std::copy(cast_dptr, cast_dptr + num, weights_.begin()));
+                       std::copy(cast_dptr, cast_dptr + num, weights.begin()));
   } else if (!std::strcmp(key, "base_margin")) {
-    base_margin_.resize(num);
+    auto& base_margin = base_margin_.HostVector();
+    base_margin.resize(num);
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
-                       std::copy(cast_dptr, cast_dptr + num, base_margin_.begin()));
+                       std::copy(cast_dptr, cast_dptr + num, base_margin.begin()));
   } else if (!std::strcmp(key, "group")) {
     group_ptr_.resize(num + 1);
     DISPATCH_CONST_PTR(dtype, dptr, cast_dptr,
@@ -147,7 +150,8 @@ void MetaInfo::SetInfo(const char* key, const void* dptr, DataType dtype, size_t
 DMatrix* DMatrix::Load(const std::string& uri,
                        bool silent,
                        bool load_row_split,
-                       const std::string& file_format) {
+                       const std::string& file_format,
+                       const size_t page_size) {
   std::string fname, cache_file;
   size_t dlm_pos = uri.find('#');
   if (dlm_pos != std::string::npos) {
@@ -214,13 +218,13 @@ DMatrix* DMatrix::Load(const std::string& uri,
 
   std::unique_ptr<dmlc::Parser<uint32_t> > parser(
       dmlc::Parser<uint32_t>::Create(fname.c_str(), partid, npart, file_format.c_str()));
-  DMatrix* dmat = DMatrix::Create(parser.get(), cache_file);
+  DMatrix* dmat = DMatrix::Create(parser.get(), cache_file, page_size);
   if (!silent) {
     LOG(CONSOLE) << dmat->Info().num_row_ << 'x' << dmat->Info().num_col_ << " matrix with "
                  << dmat->Info().num_nonzero_ << " entries loaded from " << uri;
   }
   /* sync up number of features after matrix loaded.
-   * partitioned data will fail the train/val validation check 
+   * partitioned data will fail the train/val validation check
    * since partitioned data not knowing the real number of features. */
   rabit::Allreduce<rabit::op::Max>(&dmat->Info().num_col_, 1);
   // backward compatiblity code.
@@ -230,12 +234,14 @@ DMatrix* DMatrix::Load(const std::string& uri,
       LOG(CONSOLE) << info.group_ptr_.size() - 1
                    << " groups are loaded from " << fname << ".group";
     }
-    if (MetaTryLoadFloatInfo(fname + ".base_margin", &info.base_margin_) && !silent) {
-      LOG(CONSOLE) << info.base_margin_.size()
+    if (MetaTryLoadFloatInfo
+        (fname + ".base_margin", &info.base_margin_.HostVector()) && !silent) {
+      LOG(CONSOLE) << info.base_margin_.Size()
                    << " base_margin are loaded from " << fname << ".base_margin";
     }
-    if (MetaTryLoadFloatInfo(fname + ".weight", &info.weights_) && !silent) {
-      LOG(CONSOLE) << info.weights_.size()
+    if (MetaTryLoadFloatInfo
+        (fname + ".weight", &info.weights_.HostVector()) && !silent) {
+      LOG(CONSOLE) << info.weights_.Size()
                    << " weights are loaded from " << fname << ".weight";
     }
   }
@@ -243,22 +249,24 @@ DMatrix* DMatrix::Load(const std::string& uri,
 }
 
 DMatrix* DMatrix::Create(dmlc::Parser<uint32_t>* parser,
-                         const std::string& cache_prefix) {
+                         const std::string& cache_prefix,
+                         const size_t page_size) {
   if (cache_prefix.length() == 0) {
     std::unique_ptr<data::SimpleCSRSource> source(new data::SimpleCSRSource());
     source->CopyFrom(parser);
     return DMatrix::Create(std::move(source), cache_prefix);
   } else {
 #if DMLC_ENABLE_STD_THREAD
-    if (!data::SparsePageSource::CacheExist(cache_prefix)) {
-      data::SparsePageSource::Create(parser, cache_prefix);
+    if (!data::SparsePageSource::CacheExist(cache_prefix, ".row.page")) {
+      data::SparsePageSource::CreateRowPage(parser, cache_prefix, page_size);
     }
-    std::unique_ptr<data::SparsePageSource> source(new data::SparsePageSource(cache_prefix));
+    std::unique_ptr<data::SparsePageSource> source(
+        new data::SparsePageSource(cache_prefix, ".row.page"));
     return DMatrix::Create(std::move(source), cache_prefix);
 #else
     LOG(FATAL) << "External memory is not enabled in mingw";
     return nullptr;
-#endif
+#endif  // DMLC_ENABLE_STD_THREAD
   }
 }
 
@@ -279,7 +287,7 @@ DMatrix* DMatrix::Create(std::unique_ptr<DataSource>&& source,
 #else
     LOG(FATAL) << "External memory is not enabled in mingw";
     return nullptr;
-#endif
+#endif  // DMLC_ENABLE_STD_THREAD
   }
 }
 }  // namespace xgboost
@@ -309,6 +317,99 @@ data::SparsePageFormat::DecideFormat(const std::string& cache_prefix) {
     std::string raw = "raw";
     return std::make_pair(raw, raw);
   }
+}
+
+void SparsePage::Push(const SparsePage &batch) {
+  auto& data_vec = data.HostVector();
+  auto& offset_vec = offset.HostVector();
+  const auto& batch_offset_vec = batch.offset.HostVector();
+  const auto& batch_data_vec = batch.data.HostVector();
+  size_t top = offset_vec.back();
+  data_vec.resize(top + batch.data.Size());
+  std::memcpy(dmlc::BeginPtr(data_vec) + top,
+              dmlc::BeginPtr(batch_data_vec),
+              sizeof(Entry) * batch.data.Size());
+  size_t begin = offset.Size();
+  offset_vec.resize(begin + batch.Size());
+  for (size_t i = 0; i < batch.Size(); ++i) {
+    offset_vec[i + begin] = top + batch_offset_vec[i + 1];
+  }
+}
+
+void SparsePage::Push(const dmlc::RowBlock<uint32_t>& batch) {
+  auto& data_vec = data.HostVector();
+  auto& offset_vec = offset.HostVector();
+  data_vec.reserve(data.Size() + batch.offset[batch.size] - batch.offset[0]);
+  offset_vec.reserve(offset.Size() + batch.size);
+  CHECK(batch.index != nullptr);
+  for (size_t i = 0; i < batch.size; ++i) {
+    offset_vec.push_back(offset_vec.back() + batch.offset[i + 1] - batch.offset[i]);
+  }
+  for (size_t i = batch.offset[0]; i < batch.offset[batch.size]; ++i) {
+    uint32_t index = batch.index[i];
+    bst_float fvalue = batch.value == nullptr ? 1.0f : batch.value[i];
+    data_vec.emplace_back(index, fvalue);
+  }
+  CHECK_EQ(offset_vec.back(), data.Size());
+}
+
+void SparsePage::PushCSC(const SparsePage &batch) {
+  std::vector<xgboost::Entry>& self_data = data.HostVector();
+  std::vector<size_t>& self_offset = offset.HostVector();
+
+  auto const& other_data = batch.data.ConstHostVector();
+  auto const& other_offset = batch.offset.ConstHostVector();
+
+  if (other_data.empty()) {
+    return;
+  }
+  if (!self_data.empty()) {
+    CHECK_EQ(self_offset.size(), other_offset.size())
+        << "self_data.size(): " << this->data.Size() << ", "
+        << "other_data.size(): " << other_data.size() << std::flush;
+  } else {
+    self_data = other_data;
+    self_offset = other_offset;
+    return;
+  }
+
+  std::vector<size_t> offset(other_offset.size());
+  offset[0] = 0;
+
+  std::vector<xgboost::Entry> data(self_data.size() + other_data.size());
+
+  // n_cols in original csr data matrix, here in csc is n_rows
+  size_t const n_features = other_offset.size() - 1;
+  size_t beg = 0;
+  size_t ptr = 1;
+  for (size_t i = 0; i < n_features; ++i) {
+    size_t const self_beg = self_offset.at(i);
+    size_t const self_length = self_offset.at(i+1) - self_beg;
+    // It is possible that the current feature and further features aren't referenced
+    // in any rows accumulated thus far. It is also possible for this to happen
+    // in the current sparse page row batch as well.
+    // Hence, the incremental number of rows may stay constant thus equaling the data size
+    CHECK_LE(beg, data.size());
+    std::memcpy(dmlc::BeginPtr(data)+beg,
+                dmlc::BeginPtr(self_data) + self_beg,
+                sizeof(Entry) * self_length);
+    beg += self_length;
+
+    size_t const other_beg = other_offset.at(i);
+    size_t const other_length = other_offset.at(i+1) - other_beg;
+    CHECK_LE(beg, data.size());
+    std::memcpy(dmlc::BeginPtr(data)+beg,
+                dmlc::BeginPtr(other_data) + other_beg,
+                sizeof(Entry) * other_length);
+    beg += other_length;
+
+    CHECK_LT(ptr, offset.size());
+    offset.at(ptr) = beg;
+    ptr++;
+  }
+
+  self_data = std::move(data);
+  self_offset = std::move(offset);
 }
 
 namespace data {

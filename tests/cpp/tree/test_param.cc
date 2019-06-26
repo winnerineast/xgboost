@@ -1,13 +1,13 @@
 // Copyright by Contributors
 #include "../../../src/tree/param.h"
-
 #include "../helpers.h"
+#include <gtest/gtest.h>
 
 TEST(Param, VectorIOStream) {
   std::vector<int> vals = {3, 2, 1};
   std::stringstream ss;
   std::vector<int> vals_in;
-  
+
   ss << vals;
   EXPECT_EQ(ss.str(), "(3,2,1)");
 
@@ -82,12 +82,15 @@ TEST(Param, SplitEntry) {
 
   xgboost::tree::SplitEntry se2;
   EXPECT_FALSE(se1.Update(se2));
-  EXPECT_FALSE(se2.Update(-1, 100, 0, true));
-  ASSERT_TRUE(se2.Update(1, 100, 0, true));
+  EXPECT_FALSE(se2.Update(-1, 100, 0, true, xgboost::tree::GradStats(),
+                          xgboost::tree::GradStats()));
+  ASSERT_TRUE(se2.Update(1, 100, 0, true, xgboost::tree::GradStats(),
+                         xgboost::tree::GradStats()));
   ASSERT_TRUE(se1.Update(se2));
 
   xgboost::tree::SplitEntry se3;
-  se3.Update(2, 101, 0, false);
+  se3.Update(2, 101, 0, false, xgboost::tree::GradStats(),
+             xgboost::tree::GradStats());
   xgboost::tree::SplitEntry::Reduce(se2, se3);
   EXPECT_EQ(se2.SplitIndex(), 101);
   EXPECT_FALSE(se2.DefaultLeft());

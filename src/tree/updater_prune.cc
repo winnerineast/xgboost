@@ -4,12 +4,13 @@
  * \brief prune a tree given the statistics
  * \author Tianqi Chen
  */
-
+#include <rabit/rabit.h>
 #include <xgboost/tree_updater.h>
+
 #include <string>
 #include <memory>
+
 #include "./param.h"
-#include "../common/sync.h"
 #include "../common/io.h"
 
 namespace xgboost {
@@ -21,7 +22,7 @@ DMLC_REGISTRY_FILE_TAG(updater_prune);
 class TreePruner: public TreeUpdater {
  public:
   TreePruner() {
-    syncher_.reset(TreeUpdater::Create("sync"));
+    syncher_.reset(TreeUpdater::Create("sync", tparam_));
   }
   // set training parameter
   void Init(const std::vector<std::pair<std::string, std::string> >& args) override {
@@ -47,7 +48,7 @@ class TreePruner: public TreeUpdater {
   inline int TryPruneLeaf(RegTree &tree, int nid, int depth, int npruned) { // NOLINT(*)
     if (tree[nid].IsRoot()) return npruned;
     int pid = tree[nid].Parent();
-    RegTree::NodeStat &s = tree.Stat(pid);
+    RTreeNodeStat &s = tree.Stat(pid);
     ++s.leaf_child_cnt;
     if (s.leaf_child_cnt >= 2 && param_.NeedPrune(s.loss_chg, depth - 1)) {
       // need to be pruned
@@ -70,11 +71,9 @@ class TreePruner: public TreeUpdater {
         npruned = this->TryPruneLeaf(tree, nid, tree.GetDepth(nid), npruned);
       }
     }
-    if (!param_.silent) {
-      LOG(INFO) << "tree pruning end, " << tree.param.num_roots << " roots, "
-                << tree.NumExtraNodes() << " extra nodes, " << npruned
-                << " pruned nodes, max_depth=" << tree.MaxDepth();
-    }
+    LOG(INFO) << "tree pruning end, " << tree.param.num_roots << " roots, "
+              << tree.NumExtraNodes() << " extra nodes, " << npruned
+              << " pruned nodes, max_depth=" << tree.MaxDepth();
   }
 
  private:

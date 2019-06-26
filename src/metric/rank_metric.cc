@@ -4,11 +4,68 @@
  * \brief prediction rank based metrics.
  * \author Kailong Chen, Tianqi Chen
  */
+#include <rabit/rabit.h>
 #include <xgboost/metric.h>
 #include <dmlc/registry.h>
 #include <cmath>
-#include "../common/sync.h"
+
+#include <vector>
+
+#include "../common/host_device_vector.h"
 #include "../common/math.h"
+
+namespace {
+
+/*
+ * Adapter to access instance weights.
+ *
+ *  - For ranking task, weights are per-group
+ *  - For binary classification task, weights are per-instance
+ *
+ * WeightPolicy::GetWeightOfInstance() :
+ *   get weight associated with an individual instance, using index into
+ *   `info.weights`
+ * WeightPolicy::GetWeightOfSortedRecord() :
+ *   get weight associated with an individual instance, using index into
+ *   sorted records `rec` (in ascending order of predicted labels). `rec` is
+ *   of type PredIndPairContainer
+ */
+
+using PredIndPairContainer
+  = std::vector<std::pair<xgboost::bst_float, unsigned>>;
+
+class PerInstanceWeightPolicy {
+ public:
+  inline static xgboost::bst_float
+  GetWeightOfInstance(const xgboost::MetaInfo& info,
+                      unsigned instance_id, unsigned group_id) {
+    return info.GetWeight(instance_id);
+  }
+  inline static xgboost::bst_float
+  GetWeightOfSortedRecord(const xgboost::MetaInfo& info,
+                          const PredIndPairContainer& rec,
+                          unsigned record_id, unsigned group_id) {
+    return info.GetWeight(rec[record_id].second);
+  }
+};
+
+class PerGroupWeightPolicy {
+ public:
+  inline static xgboost::bst_float
+  GetWeightOfInstance(const xgboost::MetaInfo& info,
+                      unsigned instance_id, unsigned group_id) {
+    return info.GetWeight(group_id);
+  }
+
+  inline static xgboost::bst_float
+  GetWeightOfSortedRecord(const xgboost::MetaInfo& info,
+                          const PredIndPairContainer& rec,
+                          unsigned record_id, unsigned group_id) {
+    return info.GetWeight(group_id);
+  }
+};
+
+}  // anonymous namespace
 
 namespace xgboost {
 namespace metric {
@@ -26,18 +83,20 @@ struct EvalAMS : public Metric {
     os << "ams@" << ratio_;
     name_ = os.str();
   }
-  bst_float Eval(const std::vector<bst_float> &preds,
+
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
                  const MetaInfo &info,
-                 bool distributed) const override {
+                 bool distributed) override {
     CHECK(!distributed) << "metric AMS do not support distributed evaluation";
     using namespace std;  // NOLINT(*)
 
-    const auto ndata = static_cast<bst_omp_uint>(info.labels_.size());
+    const auto ndata = static_cast<bst_omp_uint>(info.labels_.Size());
     std::vector<std::pair<bst_float, unsigned> > rec(ndata);
 
-    #pragma omp parallel for schedule(static)
+    const std::vector<bst_float>& h_preds = preds.HostVector();
+#pragma omp parallel for schedule(static)
     for (bst_omp_uint i = 0; i < ndata; ++i) {
-      rec[i] = std::make_pair(preds[i], i);
+      rec[i] = std::make_pair(h_preds[i], i);
     }
     std::sort(rec.begin(), rec.end(), common::CmpFirst);
     auto ntop = static_cast<unsigned>(ratio_ * ndata);
@@ -45,10 +104,11 @@ struct EvalAMS : public Metric {
     const double br = 10.0;
     unsigned thresindex = 0;
     double s_tp = 0.0, b_fp = 0.0, tams = 0.0;
+    const auto& labels = info.labels_.HostVector();
     for (unsigned i = 0; i < static_cast<unsigned>(ndata-1) && i < ntop; ++i) {
       const unsigned ridx = rec[i].second;
       const bst_float wt = info.GetWeight(ridx);
-      if (info.labels_[ridx] > 0.5f) {
+      if (labels[ridx] > 0.5f) {
         s_tp += wt;
       } else {
         b_fp += wt;
@@ -81,36 +141,41 @@ struct EvalAMS : public Metric {
 
 /*! \brief Area Under Curve, for both classification and rank */
 struct EvalAuc : public Metric {
-  bst_float Eval(const std::vector<bst_float> &preds,
+ private:
+  template <typename WeightPolicy>
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
                  const MetaInfo &info,
-                 bool distributed) const override {
-    CHECK_NE(info.labels_.size(), 0U) << "label set cannot be empty";
-    CHECK_EQ(preds.size(), info.labels_.size())
+                 bool distributed) {
+    CHECK_NE(info.labels_.Size(), 0U) << "label set cannot be empty";
+    CHECK_EQ(preds.Size(), info.labels_.Size())
         << "label size predict size not match";
     std::vector<unsigned> tgptr(2, 0);
-    tgptr[1] = static_cast<unsigned>(info.labels_.size());
+    tgptr[1] = static_cast<unsigned>(info.labels_.Size());
 
-    const std::vector<unsigned> &gptr = info.group_ptr_.size() == 0 ? tgptr : info.group_ptr_;
-    CHECK_EQ(gptr.back(), info.labels_.size())
+    const std::vector<unsigned> &gptr = info.group_ptr_.empty() ? tgptr : info.group_ptr_;
+    CHECK_EQ(gptr.back(), info.labels_.Size())
         << "EvalAuc: group structure must match number of prediction";
     const auto ngroup = static_cast<bst_omp_uint>(gptr.size() - 1);
-    // sum statistics
-    bst_float sum_auc = 0.0f;
+    // sum of all AUC's across all query groups
+    double sum_auc = 0.0;
     int auc_error = 0;
     // each thread takes a local rec
-    std::vector< std::pair<bst_float, unsigned> > rec;
-    for (bst_omp_uint k = 0; k < ngroup; ++k) {
+    std::vector<std::pair<bst_float, unsigned>> rec;
+    const auto& labels = info.labels_.HostVector();
+    const std::vector<bst_float>& h_preds = preds.HostVector();
+    for (bst_omp_uint group_id = 0; group_id < ngroup; ++group_id) {
       rec.clear();
-      for (unsigned j = gptr[k]; j < gptr[k + 1]; ++j) {
-        rec.emplace_back(preds[j], j);
+      for (unsigned j = gptr[group_id]; j < gptr[group_id + 1]; ++j) {
+        rec.emplace_back(h_preds[j], j);
       }
       XGBOOST_PARALLEL_SORT(rec.begin(), rec.end(), common::CmpFirst);
       // calculate AUC
       double sum_pospair = 0.0;
       double sum_npos = 0.0, sum_nneg = 0.0, buf_pos = 0.0, buf_neg = 0.0;
       for (size_t j = 0; j < rec.size(); ++j) {
-        const bst_float wt = info.GetWeight(rec[j].second);
-        const bst_float ctr = info.labels_[rec[j].second];
+        const bst_float wt
+          = WeightPolicy::GetWeightOfSortedRecord(info, rec, j, group_id);
+        const bst_float ctr = labels[rec[j].second];
         // keep bucketing predictions in same bucket
         if (j != 0 && rec[j].first != rec[j - 1].first) {
           sum_pospair += buf_neg * (sum_npos + buf_pos *0.5);
@@ -121,7 +186,7 @@ struct EvalAuc : public Metric {
         buf_pos += ctr * wt;
         buf_neg += (1.0f - ctr) * wt;
       }
-      sum_pospair += buf_neg * (sum_npos + buf_pos *0.5);
+      sum_pospair += buf_neg * (sum_npos + buf_pos * 0.5);
       sum_npos += buf_pos;
       sum_nneg += buf_neg;
       // check weird conditions
@@ -130,19 +195,34 @@ struct EvalAuc : public Metric {
         continue;
       }
       // this is the AUC
-      sum_auc += sum_pospair / (sum_npos*sum_nneg);
+      sum_auc += sum_pospair / (sum_npos * sum_nneg);
     }
     CHECK(!auc_error)
       << "AUC: the dataset only contains pos or neg samples";
+    /* Report average AUC across all groups */
     if (distributed) {
       bst_float dat[2];
       dat[0] = static_cast<bst_float>(sum_auc);
       dat[1] = static_cast<bst_float>(ngroup);
-      // approximately estimate auc using mean
       rabit::Allreduce<rabit::op::Sum>(dat, 2);
       return dat[0] / dat[1];
     } else {
       return static_cast<bst_float>(sum_auc) / ngroup;
+    }
+  }
+
+ public:
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
+                 const MetaInfo &info,
+                 bool distributed) override {
+    // For ranking task, weights are per-group
+    // For binary classification task, weights are per-instance
+    const bool is_ranking_task =
+      !info.group_ptr_.empty() && info.weights_.Size() != info.num_row_;
+    if (is_ranking_task) {
+      return Eval<PerGroupWeightPolicy>(preds, info, distributed);
+    } else {
+      return Eval<PerInstanceWeightPolicy>(preds, info, distributed);
     }
   }
   const char* Name() const override {
@@ -153,22 +233,25 @@ struct EvalAuc : public Metric {
 /*! \brief Evaluate rank list */
 struct EvalRankList : public Metric {
  public:
-  bst_float Eval(const std::vector<bst_float> &preds,
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
                  const MetaInfo &info,
-                 bool distributed) const override {
-    CHECK_EQ(preds.size(), info.labels_.size())
+                 bool distributed) override {
+    CHECK_EQ(preds.Size(), info.labels_.Size())
         << "label size predict size not match";
     // quick consistency when group is not available
     std::vector<unsigned> tgptr(2, 0);
-    tgptr[1] = static_cast<unsigned>(preds.size());
+    tgptr[1] = static_cast<unsigned>(preds.Size());
     const std::vector<unsigned> &gptr = info.group_ptr_.size() == 0 ? tgptr : info.group_ptr_;
     CHECK_NE(gptr.size(), 0U) << "must specify group when constructing rank file";
-    CHECK_EQ(gptr.back(), preds.size())
+    CHECK_EQ(gptr.back(), preds.Size())
         << "EvalRanklist: group structure must match number of prediction";
     const auto ngroup = static_cast<bst_omp_uint>(gptr.size() - 1);
     // sum statistics
     double sum_metric = 0.0f;
-    #pragma omp parallel reduction(+:sum_metric)
+    const auto& labels = info.labels_.HostVector();
+
+    const std::vector<bst_float>& h_preds = preds.HostVector();
+#pragma omp parallel reduction(+:sum_metric)
     {
       // each thread takes a local rec
       std::vector< std::pair<bst_float, unsigned> > rec;
@@ -176,7 +259,7 @@ struct EvalRankList : public Metric {
       for (bst_omp_uint k = 0; k < ngroup; ++k) {
         rec.clear();
         for (unsigned j = gptr[k]; j < gptr[k + 1]; ++j) {
-          rec.emplace_back(preds[j], static_cast<int>(info.labels_[j]));
+          rec.emplace_back(h_preds[j], static_cast<int>(labels[j]));
         }
         sum_metric += this->EvalMetric(rec);
       }
@@ -308,35 +391,38 @@ struct EvalMAP : public EvalRankList {
 struct EvalCox : public Metric {
  public:
   EvalCox() = default;
-  bst_float Eval(const std::vector<bst_float> &preds,
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
                  const MetaInfo &info,
-                 bool distributed) const override {
+                 bool distributed) override {
     CHECK(!distributed) << "Cox metric does not support distributed evaluation";
     using namespace std;  // NOLINT(*)
 
-    const auto ndata = static_cast<bst_omp_uint>(info.labels_.size());
+    const auto ndata = static_cast<bst_omp_uint>(info.labels_.Size());
     const std::vector<size_t> &label_order = info.LabelAbsSort();
 
     // pre-compute a sum for the denominator
     double exp_p_sum = 0;  // we use double because we might need the precision with large datasets
+
+    const std::vector<bst_float>& h_preds = preds.HostVector();
     for (omp_ulong i = 0; i < ndata; ++i) {
-      exp_p_sum += preds[i];
+      exp_p_sum += h_preds[i];
     }
 
     double out = 0;
     double accumulated_sum = 0;
     bst_omp_uint num_events = 0;
+    const auto& labels = info.labels_.HostVector();
     for (bst_omp_uint i = 0; i < ndata; ++i) {
       const size_t ind = label_order[i];
-      const auto label = info.labels_[ind];
+      const auto label = labels[ind];
       if (label > 0) {
-        out -= log(preds[ind]) - log(exp_p_sum);
+        out -= log(h_preds[ind]) - log(exp_p_sum);
         ++num_events;
       }
 
       // only update the denominator after we move forward in time (labels are sorted)
-      accumulated_sum += preds[ind];
-      if (i == ndata - 1 || std::abs(label) < std::abs(info.labels_[label_order[i + 1]])) {
+      accumulated_sum += h_preds[ind];
+      if (i == ndata - 1 || std::abs(label) < std::abs(labels[label_order[i + 1]])) {
         exp_p_sum -= accumulated_sum;
         accumulated_sum = 0;
       }
@@ -355,32 +441,39 @@ struct EvalAucPR : public Metric {
   // implementation of AUC-PR for weighted data
   // translated from PRROC R Package
   // see https://doi.org/10.1371/journal.pone.0092209
-
-  bst_float Eval(const std::vector<bst_float> &preds, const MetaInfo &info,
-                 bool distributed) const override {
-    CHECK_NE(info.labels_.size(), 0U) << "label set cannot be empty";
-    CHECK_EQ(preds.size(), info.labels_.size())
+ private:
+  template <typename WeightPolicy>
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
+                 const MetaInfo &info,
+                 bool distributed) {
+    CHECK_NE(info.labels_.Size(), 0U) << "label set cannot be empty";
+    CHECK_EQ(preds.Size(), info.labels_.Size())
         << "label size predict size not match";
     std::vector<unsigned> tgptr(2, 0);
-    tgptr[1] = static_cast<unsigned>(info.labels_.size());
+    tgptr[1] = static_cast<unsigned>(info.labels_.Size());
     const std::vector<unsigned> &gptr =
         info.group_ptr_.size() == 0 ? tgptr : info.group_ptr_;
-    CHECK_EQ(gptr.back(), info.labels_.size())
+    CHECK_EQ(gptr.back(), info.labels_.Size())
         << "EvalAucPR: group structure must match number of prediction";
     const auto ngroup = static_cast<bst_omp_uint>(gptr.size() - 1);
-    // sum statistics
-    double auc = 0.0;
-    int auc_error = 0, auc_gt_one = 0;
+    // sum of all AUC's across all query groups
+    double sum_auc = 0.0;
+    int auc_error = 0;
     // each thread takes a local rec
     std::vector<std::pair<bst_float, unsigned>> rec;
-    for (bst_omp_uint k = 0; k < ngroup; ++k) {
+    const auto& h_labels = info.labels_.HostVector();
+    const std::vector<bst_float>& h_preds = preds.HostVector();
+
+    for (bst_omp_uint group_id = 0; group_id < ngroup; ++group_id) {
       double total_pos = 0.0;
       double total_neg = 0.0;
       rec.clear();
-      for (unsigned j = gptr[k]; j < gptr[k + 1]; ++j) {
-        total_pos += info.GetWeight(j) * info.labels_[j];
-        total_neg += info.GetWeight(j) * (1.0f - info.labels_[j]);
-        rec.emplace_back(preds[j], j);
+      for (unsigned j = gptr[group_id]; j < gptr[group_id + 1]; ++j) {
+        const bst_float wt
+          = WeightPolicy::GetWeightOfInstance(info, j, group_id);
+        total_pos += wt * h_labels[j];
+        total_neg += wt * (1.0f - h_labels[j]);
+        rec.emplace_back(h_preds[j], j);
       }
       XGBOOST_PARALLEL_SORT(rec.begin(), rec.end(), common::CmpFirst);
       // we need pos > 0 && neg > 0
@@ -390,8 +483,10 @@ struct EvalAucPR : public Metric {
       // calculate AUC
       double tp = 0.0, prevtp = 0.0, fp = 0.0, prevfp = 0.0, h = 0.0, a = 0.0, b = 0.0;
       for (size_t j = 0; j < rec.size(); ++j) {
-        tp += info.GetWeight(rec[j].second) * info.labels_[rec[j].second];
-        fp += info.GetWeight(rec[j].second) * (1.0f - info.labels_[rec[j].second]);
+        const bst_float wt
+          = WeightPolicy::GetWeightOfSortedRecord(info, rec, j, group_id);
+        tp += wt * h_labels[rec[j].second];
+        fp += wt * (1.0f - h_labels[rec[j].second]);
         if ((j < rec.size() - 1 && rec[j].first != rec[j + 1].first) || j  == rec.size() - 1) {
           if (tp == prevtp) {
             a = 1.0;
@@ -402,14 +497,11 @@ struct EvalAucPR : public Metric {
             b = (prevfp - h * prevtp) / total_pos;
           }
           if (0.0 != b) {
-            auc += (tp / total_pos - prevtp / total_pos -
-                    b / a * (std::log(a * tp / total_pos + b) -
-                             std::log(a * prevtp / total_pos + b))) / a;
+            sum_auc += (tp / total_pos - prevtp / total_pos -
+                        b / a * (std::log(a * tp / total_pos + b) -
+                                 std::log(a * prevtp / total_pos + b))) / a;
           } else {
-            auc += (tp / total_pos - prevtp / total_pos) / a;
-          }
-          if (auc > 1.0) {
-            auc_gt_one = 1;
+            sum_auc += (tp / total_pos - prevtp / total_pos) / a;
           }
           prevtp = tp;
           prevfp = fp;
@@ -421,16 +513,32 @@ struct EvalAucPR : public Metric {
       }
     }
     CHECK(!auc_error) << "AUC-PR: the dataset only contains pos or neg samples";
-    CHECK(!auc_gt_one) << "AUC-PR: AUC > 1.0";
+    /* Report average AUC across all groups */
     if (distributed) {
       bst_float dat[2];
-      dat[0] = static_cast<bst_float>(auc);
+      dat[0] = static_cast<bst_float>(sum_auc);
       dat[1] = static_cast<bst_float>(ngroup);
-      // approximately estimate auc using mean
       rabit::Allreduce<rabit::op::Sum>(dat, 2);
+      CHECK_LE(dat[0], dat[1]) << "AUC-PR: AUC > 1.0";
       return dat[0] / dat[1];
     } else {
-      return static_cast<bst_float>(auc) / ngroup;
+      CHECK_LE(sum_auc, static_cast<double>(ngroup)) << "AUC-PR: AUC > 1.0";
+      return static_cast<bst_float>(sum_auc) / ngroup;
+    }
+  }
+
+ public:
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
+                 const MetaInfo &info,
+                 bool distributed) override {
+    // For ranking task, weights are per-group
+    // For binary classification task, weights are per-instance
+    const bool is_ranking_task =
+      !info.group_ptr_.empty() && info.weights_.Size() != info.num_row_;
+    if (is_ranking_task) {
+      return Eval<PerGroupWeightPolicy>(preds, info, distributed);
+    } else {
+      return Eval<PerInstanceWeightPolicy>(preds, info, distributed);
     }
   }
   const char *Name() const override { return "aucpr"; }
@@ -466,4 +574,3 @@ XGBOOST_REGISTER_METRIC(Cox, "cox-nloglik")
 .set_body([](const char* param) { return new EvalCox(); });
 }  // namespace metric
 }  // namespace xgboost
-

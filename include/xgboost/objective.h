@@ -8,19 +8,24 @@
 #define XGBOOST_OBJECTIVE_H_
 
 #include <dmlc/registry.h>
+#include <xgboost/base.h>
+#include <xgboost/data.h>
+#include <xgboost/generic_parameters.h>
+
 #include <vector>
 #include <utility>
 #include <string>
 #include <functional>
-#include "./data.h"
-#include "./base.h"
-#include "../../src/common/host_device_vector.h"
 
+#include "../../src/common/host_device_vector.h"
 
 namespace xgboost {
 
 /*! \brief interface of objective function */
 class ObjFunction {
+ protected:
+  LearnerTrainParam const* tparam_;
+
  public:
   /*! \brief virtual destructor */
   virtual ~ObjFunction() = default;
@@ -44,7 +49,7 @@ class ObjFunction {
    * \param iteration current iteration number.
    * \param out_gpair output of get gradient, saves gradient and second order gradient in
    */
-  virtual void GetGradient(HostDeviceVector<bst_float>* preds,
+  virtual void GetGradient(const HostDeviceVector<bst_float>& preds,
                            const MetaInfo& info,
                            int iteration,
                            HostDeviceVector<GradientPair>* out_gpair) = 0;
@@ -77,9 +82,10 @@ class ObjFunction {
   }
   /*!
    * \brief Create an objective function according to name.
+   * \param tparam Generic parameters.
    * \param name Name of the objective.
    */
-  static ObjFunction* Create(const std::string& name);
+  static ObjFunction* Create(const std::string& name, LearnerTrainParam const* tparam);
 };
 
 // implementing configure.
@@ -102,7 +108,7 @@ struct ObjFunctionReg
  *
  * \code
  * // example of registering a objective
- * XGBOOST_REGISTER_OBJECTIVE(LinearRegression, "reg:linear")
+ * XGBOOST_REGISTER_OBJECTIVE(LinearRegression, "reg:squarederror")
  * .describe("Linear regression objective")
  * .set_body([]() {
  *     return new RegLossObj(LossType::kLinearSquare);

@@ -10,7 +10,7 @@
 
 #ifdef __CUDACC__
 #include "device_helpers.cuh"
-#endif
+#endif  // __CUDACC__
 
 namespace xgboost {
 namespace common {
@@ -111,11 +111,11 @@ class CompressedBufferWriter {
     symbol <<= 7 - ibit_end % 8;
     for (ptrdiff_t ibyte = ibyte_end; ibyte >= (ptrdiff_t)ibyte_start; --ibyte) {
       dh::AtomicOrByte(reinterpret_cast<unsigned int*>(buffer + detail::kPadding),
-                   ibyte, symbol & 0xff);
+                       ibyte, symbol & 0xff);
       symbol >>= 8;
     }
   }
-#endif
+#endif  // __CUDACC__
 
   template <typename IterT>
   void Write(CompressedByteT *buffer, IterT input_begin, IterT input_end) {
