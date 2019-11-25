@@ -423,7 +423,7 @@ XGBOOST_REGISTER_TREE_IO(JsonGenerator, "json")
             return new JsonGenerator(fmap, attrs, with_stats);
           });
 
-struct GraphvizParam : public dmlc::Parameter<GraphvizParam> {
+struct GraphvizParam : public XGBoostParameter<GraphvizParam> {
   std::string yes_color;
   std::string no_color;
   std::string rankdir;
@@ -457,13 +457,12 @@ DMLC_REGISTER_PARAMETER(GraphvizParam);
 
 class GraphvizGenerator : public TreeGenerator {
   using SuperT = TreeGenerator;
-  std::stringstream& ss_;
   GraphvizParam param_;
 
  public:
   GraphvizGenerator(FeatureMap const& fmap, std::string const& attrs, bool with_stats) :
-      TreeGenerator(fmap, with_stats), ss_{SuperT::ss_} {
-    param_.InitAllowUnknown(std::map<std::string, std::string>{});
+      TreeGenerator(fmap, with_stats) {
+    param_.UpdateAllowUnknown(std::map<std::string, std::string>{});
     using KwArg = std::map<std::string, std::map<std::string, std::string>>;
     KwArg kwargs;
     if (attrs.length() != 0) {
@@ -616,6 +615,35 @@ std::string RegTree::DumpModel(const FeatureMap& fmap,
 
   std::string result = builder->Str();
   return result;
+}
+
+void RegTree::LoadModel(dmlc::Stream* fi) {
+  CHECK_EQ(fi->Read(&param, sizeof(TreeParam)), sizeof(TreeParam));
+  nodes_.resize(param.num_nodes);
+  stats_.resize(param.num_nodes);
+  CHECK_NE(param.num_nodes, 0);
+  CHECK_EQ(fi->Read(dmlc::BeginPtr(nodes_), sizeof(Node) * nodes_.size()),
+           sizeof(Node) * nodes_.size());
+  CHECK_EQ(fi->Read(dmlc::BeginPtr(stats_), sizeof(RTreeNodeStat) * stats_.size()),
+           sizeof(RTreeNodeStat) * stats_.size());
+  // chg deleted nodes
+  deleted_nodes_.resize(0);
+  for (int i = param.num_roots; i < param.num_nodes; ++i) {
+    if (nodes_[i].IsDeleted()) deleted_nodes_.push_back(i);
+  }
+  CHECK_EQ(static_cast<int>(deleted_nodes_.size()), param.num_deleted);
+}
+/*!
+   * \brief save model to stream
+   * \param fo output stream
+   */
+void RegTree::SaveModel(dmlc::Stream* fo) const {
+  CHECK_EQ(param.num_nodes, static_cast<int>(nodes_.size()));
+  CHECK_EQ(param.num_nodes, static_cast<int>(stats_.size()));
+  fo->Write(&param, sizeof(TreeParam));
+  CHECK_NE(param.num_nodes, 0);
+  fo->Write(dmlc::BeginPtr(nodes_), sizeof(Node) * nodes_.size());
+  fo->Write(dmlc::BeginPtr(stats_), sizeof(RTreeNodeStat) * nodes_.size());
 }
 
 void RegTree::FillNodeMeanValues() {

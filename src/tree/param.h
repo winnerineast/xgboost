@@ -7,20 +7,20 @@
 #ifndef XGBOOST_TREE_PARAM_H_
 #define XGBOOST_TREE_PARAM_H_
 
-#include <dmlc/parameter.h>
-#include <xgboost/data.h>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
 
+#include "xgboost/parameter.h"
+#include "xgboost/data.h"
 
 namespace xgboost {
 namespace tree {
 
 /*! \brief training parameters for regression tree */
-struct TrainParam : public dmlc::Parameter<TrainParam> {
+struct TrainParam : public XGBoostParameter<TrainParam> {
   // learning step size for a time
   float learning_rate;
   // minimum loss change required for a split
@@ -62,8 +62,6 @@ struct TrainParam : public dmlc::Parameter<TrainParam> {
   float sketch_eps;
   // accuracy of sketch
   float sketch_ratio;
-  // leaf vector size
-  int size_leaf_vector;
   // option for parallelization
   int parallel_option;
   // option to open cacheline optimization
@@ -176,10 +174,6 @@ struct TrainParam : public dmlc::Parameter<TrainParam> {
         .set_lower_bound(0.0f)
         .set_default(2.0f)
         .describe("EXP Param: Sketch accuracy related parameter of approximate algorithm.");
-    DMLC_DECLARE_FIELD(size_leaf_vector)
-        .set_lower_bound(0)
-        .set_default(0)
-        .describe("Size of leaf vectors, reserved for vector trees");
     DMLC_DECLARE_FIELD(parallel_option)
         .set_default(0)
         .describe("Different types of parallelization algorithm.");
@@ -200,7 +194,7 @@ struct TrainParam : public dmlc::Parameter<TrainParam> {
                   "indices of features that are allowed to interact with each other."
                   "See tutorial for more information");
     DMLC_DECLARE_FIELD(split_evaluator)
-        .set_default("elastic_net,monotonic,interaction")
+        .set_default("elastic_net,monotonic")
         .describe("The criteria to use for ranking splits");
 
     // ------ From cpu quantile histogram -------.
@@ -239,10 +233,6 @@ struct TrainParam : public dmlc::Parameter<TrainParam> {
   /*! \brief given the loss change, whether we need to invoke pruning */
   inline bool NeedPrune(double loss_chg, int depth) const {
     return loss_chg < this->min_split_loss;
-  }
-  /*! \brief whether we can split with current hessian */
-  inline bool CannotSplit(double sum_hess, int depth) const {
-    return sum_hess < this->min_child_weight * 2.0;
   }
   /*! \brief maximum sketch size */
   inline unsigned MaxSketchSize() const {
@@ -399,82 +389,13 @@ struct XGBOOST_ALIGNAS(16) GradStats {
   }
 };
 
-// TODO(trivialfis): Remove this class.
-struct ValueConstraint {
-  double lower_bound;
-  double upper_bound;
-  XGBOOST_DEVICE ValueConstraint()
-      : lower_bound(-std::numeric_limits<double>::max()),
-        upper_bound(std::numeric_limits<double>::max()) {}
-  inline static void Init(TrainParam *param, unsigned num_feature) {
-    param->monotone_constraints.resize(num_feature, 0);
-  }
-  template <typename ParamT>
-  XGBOOST_DEVICE inline double CalcWeight(const ParamT &param, GradStats stats) const {
-    double w = xgboost::tree::CalcWeight(param, stats);
-    if (w < lower_bound) {
-      return lower_bound;
-    }
-    if (w > upper_bound) {
-      return upper_bound;
-    }
-    return w;
-  }
-
-  template <typename ParamT>
-  XGBOOST_DEVICE inline double CalcGain(const ParamT &param, GradStats stats) const {
-    return CalcGainGivenWeight(param, stats.sum_grad, stats.sum_hess,
-                               CalcWeight(param, stats));
-  }
-
-  template <typename ParamT>
-  XGBOOST_DEVICE inline double CalcSplitGain(const ParamT &param, int constraint,
-                              GradStats left, GradStats right) const {
-    const double negative_infinity = -std::numeric_limits<double>::infinity();
-    double wleft = CalcWeight(param, left);
-    double wright = CalcWeight(param, right);
-    double gain =
-        CalcGainGivenWeight(param, left.sum_grad, left.sum_hess, wleft) +
-        CalcGainGivenWeight(param, right.sum_grad, right.sum_hess, wright);
-    if (constraint == 0) {
-      return gain;
-    } else if (constraint > 0) {
-      return wleft <= wright ? gain : negative_infinity;
-    } else {
-      return wleft >= wright ? gain : negative_infinity;
-    }
-  }
-
-  inline void SetChild(const TrainParam &param, bst_uint split_index,
-                       GradStats left, GradStats right, ValueConstraint *cleft,
-                       ValueConstraint *cright) {
-    int c = param.monotone_constraints.at(split_index);
-    *cleft = *this;
-    *cright = *this;
-    if (c == 0) {
-      return;
-    }
-    double wleft = CalcWeight(param, left);
-    double wright = CalcWeight(param, right);
-    double mid = (wleft + wright) / 2;
-    CHECK(!std::isnan(mid));
-    if (c < 0) {
-      cleft->lower_bound = mid;
-      cright->upper_bound = mid;
-    } else {
-      cleft->upper_bound = mid;
-      cright->lower_bound = mid;
-    }
-  }
-};
-
 /*!
  * \brief statistics that is helpful to store
  *   and represent a split solution for the tree
  */
 struct SplitEntry {
   /*! \brief loss change after split this node */
-  bst_float loss_chg{0.0f};
+  bst_float loss_chg {0.0f};
   /*! \brief split index */
   unsigned sindex{0};
   bst_float split_value{0.0f};

@@ -241,7 +241,7 @@ trait HasNumClass extends Params {
 
 private[spark] trait ParamMapFuncs extends Params {
 
-  def XGBoostToMLlibParams(xgboostParams: Map[String, Any]): Unit = {
+  def XGBoost2MLlibParams(xgboostParams: Map[String, Any]): Unit = {
     for ((paramName, paramValue) <- xgboostParams) {
       if ((paramName == "booster" && paramValue != "gbtree") ||
         (paramName == "updater" && paramValue != "grow_histmaker,prune" &&
@@ -251,17 +251,18 @@ private[spark] trait ParamMapFuncs extends Params {
           " and grow_histmaker,prune or hist as the updater type")
       }
       val name = CaseFormat.LOWER_UNDERSCORE.to(CaseFormat.LOWER_CAMEL, paramName)
-      params.find(_.name == name) match {
-        case None =>
-        case Some(_: DoubleParam) =>
+      params.find(_.name == name).foreach {
+        case _: DoubleParam =>
           set(name, paramValue.toString.toDouble)
-        case Some(_: BooleanParam) =>
+        case _: BooleanParam =>
           set(name, paramValue.toString.toBoolean)
-        case Some(_: IntParam) =>
+        case _: IntParam =>
           set(name, paramValue.toString.toInt)
-        case Some(_: FloatParam) =>
+        case _: FloatParam =>
           set(name, paramValue.toString.toFloat)
-        case Some(_: Param[_]) =>
+        case _: LongParam =>
+          set(name, paramValue.toString.toLong)
+        case _: Param[_] =>
           set(name, paramValue)
       }
     }

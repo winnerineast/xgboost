@@ -51,20 +51,24 @@ TEST(MetaInfo, SaveLoadBinary) {
 
   dmlc::TemporaryDirectory tempdir;
   const std::string tmp_file = tempdir.path + "/metainfo.binary";
-  dmlc::Stream* fs = dmlc::Stream::Create(tmp_file.c_str(), "w");
-  info.SaveBinary(fs);
-  delete fs;
+  {
+    std::unique_ptr<dmlc::Stream> fs {
+      dmlc::Stream::Create(tmp_file.c_str(), "w")
+    };
+    info.SaveBinary(fs.get());
+  }
 
-  ASSERT_EQ(GetFileSize(tmp_file), 84)
-    << "Expected saved binary file size to be same as object size";
+  ASSERT_EQ(GetFileSize(tmp_file), 92)
+      << "Expected saved binary file size to be same as object size";
 
-  fs = dmlc::Stream::Create(tmp_file.c_str(), "r");
+  std::unique_ptr<dmlc::Stream> fs {
+    dmlc::Stream::Create(tmp_file.c_str(), "r")
+  };
   xgboost::MetaInfo inforead;
-  inforead.LoadBinary(fs);
+  inforead.LoadBinary(fs.get());
   EXPECT_EQ(inforead.labels_.HostVector(), info.labels_.HostVector());
   EXPECT_EQ(inforead.num_col_, info.num_col_);
   EXPECT_EQ(inforead.num_row_, info.num_row_);
-  delete fs;
 }
 
 TEST(MetaInfo, LoadQid) {
@@ -92,13 +96,10 @@ TEST(MetaInfo, LoadQid) {
     xgboost::DMatrix::Load(tmp_file, true, false, "libsvm"));
 
   const xgboost::MetaInfo& info = dmat->Info();
-  const std::vector<uint64_t> expected_qids{1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
   const std::vector<xgboost::bst_uint> expected_group_ptr{0, 4, 8, 12};
-  CHECK(info.qids_ == expected_qids);
   CHECK(info.group_ptr_ == expected_group_ptr);
-  CHECK_GE(info.kVersion, info.kVersionQidAdded);
 
-  const std::vector<size_t> expected_offset{
+  const std::vector<xgboost::bst_row_t> expected_offset{
     0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
   };
   const std::vector<xgboost::Entry> expected_data{
@@ -122,7 +123,7 @@ TEST(MetaInfo, LoadQid) {
       xgboost::Entry(2, 0),   xgboost::Entry(3, 0),   xgboost::Entry(4, 0.4),
       xgboost::Entry(5, 1),   xgboost::Entry(1, 0),   xgboost::Entry(2, 1),
       xgboost::Entry(3, 1),   xgboost::Entry(4, 0.5), {5, 0}};
-  for (const auto &batch : dmat->GetRowBatches()) {
+  for (const auto &batch : dmat->GetBatches<xgboost::SparsePage>()) {
     CHECK_EQ(batch.base_rowid, 0);
     CHECK(batch.offset.HostVector() == expected_offset);
     CHECK(batch.data.HostVector() == expected_data);

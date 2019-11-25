@@ -20,7 +20,11 @@ DMLC_REGISTRY_FILE_TAG(updater_sync);
  */
 class TreeSyncher: public TreeUpdater {
  public:
-  void Init(const std::vector<std::pair<std::string, std::string> >& args) override {}
+  void Configure(const Args& args) override {}
+
+  char const* Name() const override {
+    return "prune";
+  }
 
   void Update(HostDeviceVector<GradientPair> *gpair,
               DMatrix* dmat,
@@ -31,13 +35,13 @@ class TreeSyncher: public TreeUpdater {
     int rank = rabit::GetRank();
     if (rank == 0) {
       for (auto tree : trees) {
-        tree->Save(&fs);
+        tree->SaveModel(&fs);
       }
     }
     fs.Seek(0);
     rabit::Broadcast(&s_model, 0);
     for (auto tree : trees) {
-      tree->Load(&fs);
+      tree->LoadModel(&fs);
     }
   }
 };

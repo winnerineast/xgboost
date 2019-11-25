@@ -12,13 +12,14 @@ if (USE_CUDA)
   file(GLOB_RECURSE CUDA_TEST_SOURCES "*.cu")
   list(APPEND TEST_SOURCES ${CUDA_TEST_SOURCES})
 endif (USE_CUDA)
-add_executable(testxgboost ${TEST_SOURCES} ${XGBOOST_OBJ_SOURCES})
+add_executable(testxgboost ${TEST_SOURCES} ${XGBOOST_OBJ_SOURCES}
+  ${xgboost_SOURCE_DIR}/plugin/example/custom_obj.cc)
 
 if (USE_CUDA)
   # OpenMP is mandatory for CUDA
   find_package(OpenMP REQUIRED)
   target_include_directories(testxgboost PRIVATE
-    ${PROJECT_SOURCE_DIR}/cub/)
+    ${xgboost_SOURCE_DIR}/cub/)
   target_compile_options(testxgboost PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
@@ -47,9 +48,9 @@ endif (USE_CUDA)
 target_include_directories(testxgboost
   PRIVATE
   ${GTEST_INCLUDE_DIRS}
-  ${PROJECT_SOURCE_DIR}/include
-  ${PROJECT_SOURCE_DIR}/dmlc-core/include
-  ${PROJECT_SOURCE_DIR}/rabit/include)
+  ${xgboost_SOURCE_DIR}/include
+  ${xgboost_SOURCE_DIR}/dmlc-core/include
+  ${xgboost_SOURCE_DIR}/rabit/include)
 set_target_properties(
   testxgboost PROPERTIES
   CXX_STANDARD 11
@@ -66,7 +67,7 @@ target_compile_definitions(testxgboost PRIVATE ${XGBOOST_DEFINITIONS})
 if (USE_OPENMP)
   target_compile_options(testxgboost PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${OpenMP_CXX_FLAGS}>)
 endif (USE_OPENMP)
-set_output_directory(testxgboost ${PROJECT_BINARY_DIR})
+set_output_directory(testxgboost ${xgboost_BINARY_DIR})
 
 # This grouping organises source files nicely in visual studio
 auto_source_group("${TEST_SOURCES}")

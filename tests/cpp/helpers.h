@@ -1,5 +1,5 @@
 /*!
- * Copyright 2016-2018 XGBoost contributors
+ * Copyright 2016-2019 XGBoost contributors
  */
 #ifndef XGBOOST_TESTS_CPP_HELPERS_H_
 #define XGBOOST_TESTS_CPP_HELPERS_H_
@@ -14,13 +14,19 @@
 
 #include <gtest/gtest.h>
 
+#include <dmlc/filesystem.h>
 #include <xgboost/base.h>
 #include <xgboost/objective.h>
 #include <xgboost/metric.h>
+#include <xgboost/json.h>
 #include <xgboost/predictor.h>
 #include <xgboost/generic_parameters.h>
 
 #include "../../src/common/common.h"
+#include "../../src/common/hist_util.h"
+#if defined(__CUDACC__)
+#include "../../src/data/ellpack_page.cuh"
+#endif
 
 #if defined(__CUDACC__)
 #define DeclareUnifiedTest(name) GPU ## name
@@ -29,9 +35,9 @@
 #endif
 
 #if defined(__CUDACC__)
-#define NGPUS 1
+#define GPUIDX 0
 #else
-#define NGPUS 0
+#define GPUIDX -1
 #endif
 
 bool FileExists(const std::string& filename);
@@ -42,20 +48,30 @@ void CreateSimpleTestData(const std::string& filename);
 
 void CreateBigTestData(const std::string& filename, size_t n_entries);
 
-void CheckObjFunction(xgboost::ObjFunction * obj,
+void CheckObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
                       std::vector<xgboost::bst_float> preds,
                       std::vector<xgboost::bst_float> labels,
                       std::vector<xgboost::bst_float> weights,
                       std::vector<xgboost::bst_float> out_grad,
                       std::vector<xgboost::bst_float> out_hess);
 
-void CheckRankingObjFunction(xgboost::ObjFunction * obj,
-                      std::vector<xgboost::bst_float> preds,
-                      std::vector<xgboost::bst_float> labels,
-                      std::vector<xgboost::bst_float> weights,
-                      std::vector<xgboost::bst_uint> groups,
-                      std::vector<xgboost::bst_float> out_grad,
-                      std::vector<xgboost::bst_float> out_hess);
+xgboost::Json CheckConfigReloadImpl(xgboost::Configurable* const configurable,
+                                    std::string name);
+
+template <typename T>
+xgboost::Json CheckConfigReload(std::unique_ptr<T> const& configurable,
+                                std::string name = "") {
+  return CheckConfigReloadImpl(dynamic_cast<xgboost::Configurable*>(configurable.get()),
+                               name);
+}
+
+void CheckRankingObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
+                             std::vector<xgboost::bst_float> preds,
+                             std::vector<xgboost::bst_float> labels,
+                             std::vector<xgboost::bst_float> weights,
+                             std::vector<xgboost::bst_uint> groups,
+                             std::vector<xgboost::bst_float> out_grad,
+                             std::vector<xgboost::bst_float> out_hess);
 
 xgboost::bst_float GetMetricEval(
   xgboost::Metric * metric,
@@ -163,7 +179,8 @@ class SimpleRealUniformDistribution {
 std::shared_ptr<xgboost::DMatrix> *CreateDMatrix(int rows, int columns,
                                                  float sparsity, int seed = 0);
 
-std::unique_ptr<DMatrix> CreateSparsePageDMatrix(size_t n_entries, size_t page_size);
+std::unique_ptr<DMatrix> CreateSparsePageDMatrix(
+    size_t n_entries, size_t page_size, std::string tmp_file);
 
 /**
  * \fn std::unique_ptr<DMatrix> CreateSparsePageDMatrixWithRC(size_t n_rows, size_t n_cols,
@@ -183,19 +200,71 @@ std::unique_ptr<DMatrix> CreateSparsePageDMatrix(size_t n_entries, size_t page_s
  *
  * \return The new dmatrix.
  */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrixWithRC(size_t n_rows, size_t n_cols,
-                                                       size_t page_size, bool deterministic);
+std::unique_ptr<DMatrix> CreateSparsePageDMatrixWithRC(
+    size_t n_rows, size_t n_cols, size_t page_size, bool deterministic,
+    const dmlc::TemporaryDirectory& tempdir = dmlc::TemporaryDirectory());
 
 gbm::GBTreeModel CreateTestModel();
 
-inline LearnerTrainParam CreateEmptyGenericParam(int gpu_id, int n_gpus) {
-  xgboost::LearnerTrainParam tparam;
+inline GenericParameter CreateEmptyGenericParam(int gpu_id) {
+  xgboost::GenericParameter tparam;
   std::vector<std::pair<std::string, std::string>> args {
-    {"gpu_id", std::to_string(gpu_id)},
-    {"n_gpus", std::to_string(n_gpus)}};
+    {"gpu_id", std::to_string(gpu_id)}};
   tparam.Init(args);
   return tparam;
 }
+
+#if defined(__CUDACC__)
+namespace {
+class HistogramCutsWrapper : public common::HistogramCuts {
+ public:
+  using SuperT = common::HistogramCuts;
+  void SetValues(std::vector<float> cuts) {
+    SuperT::cut_values_ = std::move(cuts);
+  }
+  void SetPtrs(std::vector<uint32_t> ptrs) {
+    SuperT::cut_ptrs_ = std::move(ptrs);
+  }
+  void SetMins(std::vector<float> mins) {
+    SuperT::min_vals_ = std::move(mins);
+  }
+};
+}  //  anonymous namespace
+
+inline std::unique_ptr<EllpackPageImpl> BuildEllpackPage(
+    int n_rows, int n_cols, bst_float sparsity= 0) {
+  auto dmat = CreateDMatrix(n_rows, n_cols, sparsity, 3);
+  const SparsePage& batch = *(*dmat)->GetBatches<xgboost::SparsePage>().begin();
+
+  HistogramCutsWrapper cmat;
+  cmat.SetPtrs({0, 3, 6, 9, 12, 15, 18, 21, 24});
+  // 24 cut fields, 3 cut fields for each feature (column).
+  cmat.SetValues({0.30f, 0.67f, 1.64f,
+          0.32f, 0.77f, 1.95f,
+          0.29f, 0.70f, 1.80f,
+          0.32f, 0.75f, 1.85f,
+          0.18f, 0.59f, 1.69f,
+          0.25f, 0.74f, 2.00f,
+          0.26f, 0.74f, 1.98f,
+          0.26f, 0.71f, 1.83f});
+  cmat.SetMins({0.1f, 0.2f, 0.3f, 0.1f, 0.2f, 0.3f, 0.2f, 0.2f});
+
+  bst_row_t row_stride = 0;
+  const auto &offset_vec = batch.offset.ConstHostVector();
+  for (size_t i = 1; i < offset_vec.size(); ++i) {
+    row_stride = std::max(row_stride, offset_vec[i] - offset_vec[i-1]);
+  }
+
+  auto page = std::unique_ptr<EllpackPageImpl>(new EllpackPageImpl(dmat->get(), {0, 256, 0}));
+  page->InitInfo(0, (*dmat)->IsDense(), row_stride, cmat);
+  page->InitCompressedData(0, n_rows);
+  page->CreateHistIndices(0, batch, RowStateOnDevice(batch.Size(), batch.Size()));
+
+  delete dmat;
+
+  return page;
+}
+#endif
 
 }  // namespace xgboost
 #endif

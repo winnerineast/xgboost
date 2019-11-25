@@ -6,6 +6,11 @@
 // Command to run command inside a docker container
 dockerRun = 'tests/ci_build/ci_build.sh'
 
+import groovy.transform.Field
+
+@Field
+def commit_id   // necessary to pass a variable from one stage to another
+
 pipeline {
   // Each stage specify its own agent
   agent none
@@ -19,7 +24,7 @@ pipeline {
   options {
     ansiColor('xterm')
     timestamps()
-    timeout(time: 120, unit: 'MINUTES')
+    timeout(time: 240, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '10'))
     preserveStashes()
   }
@@ -31,6 +36,7 @@ pipeline {
       steps {
         script {
           checkoutSrcs()
+          commit_id = "${GIT_COMMIT}"
         }
         stash name: 'srcs'
         milestone ordinal: 1
@@ -56,6 +62,7 @@ pipeline {
         script {
           parallel ([
             'build-cpu': { BuildCPU() },
+            'build-cpu-rabit-mock': { BuildCPUMock() },
             'build-gpu-cuda9.0': { BuildCUDA(cuda_version: '9.0') },
             'build-gpu-cuda10.0': { BuildCUDA(cuda_version: '10.0') },
             'build-gpu-cuda10.1': { BuildCUDA(cuda_version: '10.1') },
@@ -114,7 +121,7 @@ def ClangTidy() {
     def docker_binary = "docker"
     def dockerArgs = "--build-arg CUDA_VERSION=9.2"
     sh """
-    ${dockerRun} ${container_type} ${docker_binary} ${dockerArgs} tests/ci_build/clang_tidy.sh
+    ${dockerRun} ${container_type} ${docker_binary} ${dockerArgs} python3 tests/ci_build/tidy.py
     """
     deleteDir()
   }
@@ -156,7 +163,6 @@ def Doxygen() {
     sh """
     ${dockerRun} ${container_type} ${docker_binary} tests/ci_build/doxygen.sh ${BRANCH_NAME}
     """
-    archiveArtifacts artifacts: "build/${BRANCH_NAME}.tar.bz2", allowEmptyArchive: true
     echo 'Uploading doc...'
     s3Upload file: "build/${BRANCH_NAME}.tar.bz2", bucket: 'xgboost-docs', acl: 'PublicRead', path: "doxygen/${BRANCH_NAME}.tar.bz2"
     deleteDir()
@@ -185,6 +191,22 @@ def BuildCPU() {
   }
 }
 
+def BuildCPUMock() {
+  node('linux && cpu') {
+    unstash name: 'srcs'
+    echo "Build CPU with rabit mock"
+    def container_type = "cpu"
+    def docker_binary = "docker"
+    sh """
+    ${dockerRun} ${container_type} ${docker_binary} tests/ci_build/build_mock_cmake.sh
+    """
+     echo 'Stashing rabit C++ test executable (xgboost)...'
+    stash name: 'xgboost_rabit_tests', includes: 'xgboost'
+    deleteDir()
+  }
+}
+
+
 def BuildCUDA(args) {
   node('linux && cpu') {
     unstash name: 'srcs'
@@ -195,12 +217,14 @@ def BuildCUDA(args) {
     sh """
     ${dockerRun} ${container_type} ${docker_binary} ${docker_args} tests/ci_build/build_via_cmake.sh -DUSE_CUDA=ON -DUSE_NCCL=ON -DOPEN_MP:BOOL=ON
     ${dockerRun} ${container_type} ${docker_binary} ${docker_args} bash -c "cd python-package && rm -rf dist/* && python setup.py bdist_wheel --universal"
+    ${dockerRun} ${container_type} ${docker_binary} ${docker_args} python3 tests/ci_build/rename_whl.py python-package/dist/*.whl ${commit_id} manylinux1_x86_64
     """
     // Stash wheel for CUDA 9.0 target
     if (args.cuda_version == '9.0') {
       echo 'Stashing Python wheel...'
       stash name: 'xgboost_whl_cuda9', includes: 'python-package/dist/*.whl'
-      archiveArtifacts artifacts: "python-package/dist/*.whl", allowEmptyArchive: true
+      path = ("${BRANCH_NAME}" == 'master') ? '' : "${BRANCH_NAME}/"
+      s3Upload bucket: 'xgboost-nightly-builds', path: path, acl: 'PublicRead', workingDir: 'python-package/dist', includePathPattern:'**/*.whl'
       echo 'Stashing C++ test executable (testxgboost)...'
       stash name: 'xgboost_cpp_tests', includes: 'build/testxgboost'
     }
@@ -234,7 +258,6 @@ def BuildJVMDoc() {
     sh """
     ${dockerRun} ${container_type} ${docker_binary} tests/ci_build/build_jvm_doc.sh ${BRANCH_NAME}
     """
-    archiveArtifacts artifacts: "jvm-packages/${BRANCH_NAME}.tar.bz2", allowEmptyArchive: true
     echo 'Uploading doc...'
     s3Upload file: "jvm-packages/${BRANCH_NAME}.tar.bz2", bucket: 'xgboost-docs', acl: 'PublicRead', path: "${BRANCH_NAME}.tar.bz2"
     deleteDir()
@@ -275,6 +298,27 @@ def TestPythonGPU(args) {
       ${dockerRun} ${container_type} ${docker_binary} ${docker_args} tests/ci_build/test_python.sh gpu
       """
     }
+    // For CUDA 10.0 target, run cuDF tests too
+    if (args.cuda_version == '10.0') {
+      echo "Running tests with cuDF..."
+      sh """
+      ${dockerRun} cudf ${docker_binary} ${docker_args} tests/ci_build/test_python.sh cudf
+      """
+    }
+    deleteDir()
+  }
+}
+
+def TestCppRabit() {
+  node(nodeReq) {
+    unstash name: 'xgboost_rabit_tests'
+    unstash name: 'srcs'
+    echo "Test C++, rabit mock on"
+    def container_type = "cpu"
+    def docker_binary = "docker"
+    sh """
+    ${dockerRun} ${container_type} ${docker_binary} tests/ci_build/runxgb.sh xgboost tests/ci_build/approx.conf.in
+    """
     deleteDir()
   }
 }
@@ -330,10 +374,8 @@ def TestR(args) {
     def use_r35_flag = (args.use_r35) ? "1" : "0"
     def docker_args = "--build-arg USE_R35=${use_r35_flag}"
     sh """
-    ${dockerRun} ${container_type} ${docker_binary} ${docker_args} tests/ci_build/build_test_rpkg.sh
+    ${dockerRun} ${container_type} ${docker_binary} ${docker_args} tests/ci_build/build_test_rpkg.sh || tests/ci_build/print_r_stacktrace.sh
     """
-    // Save error log, if any
-    archiveArtifacts artifacts: "xgboost.Rcheck/00install.out", allowEmptyArchive: true
     deleteDir()
   }
 }

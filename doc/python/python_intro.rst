@@ -18,6 +18,8 @@ To verify your installation, run the following in Python:
 
   import xgboost as xgb
 
+.. _python_data_interface:
+
 Data Interface
 --------------
 The XGBoost python module is able to load data from:
@@ -26,6 +28,7 @@ The XGBoost python module is able to load data from:
 - Comma-separated values (CSV) file
 - NumPy 2D array
 - SciPy 2D sparse array
+- cuDF DataFrame
 - Pandas data frame, and
 - XGBoost binary buffer file.
 
@@ -50,7 +53,7 @@ The data is stored in a :py:class:`DMatrix <xgboost.DMatrix>` object.
 
   .. note:: Categorical features not supported
 
-    Note that XGBoost does not support categorical features; if your data contains
+    Note that XGBoost does not provide specialization for categorical features; if your data contains
     categorical features, load it as a NumPy array first and then perform
     `one-hot encoding <http://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.OneHotEncoder.html>`_.
 
@@ -113,7 +116,7 @@ XGBoost can use either a list of pairs or a dictionary to set :doc:`parameters <
 
   .. code-block:: python
 
-    param = {'max_depth': 2, 'eta': 1, 'silent': 1, 'objective': 'binary:logistic'}
+    param = {'max_depth': 2, 'eta': 1, 'objective': 'binary:logistic'}
     param['nthread'] = 4
     param['eval_metric'] = 'auc'
 

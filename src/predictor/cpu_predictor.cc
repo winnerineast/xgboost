@@ -1,11 +1,13 @@
 /*!
  * Copyright by Contributors 2017
  */
-#include <xgboost/predictor.h>
-#include <xgboost/tree_model.h>
-#include <xgboost/tree_updater.h>
-#include "dmlc/logging.h"
-#include "../common/host_device_vector.h"
+#include "xgboost/predictor.h"
+#include "xgboost/tree_model.h"
+#include "xgboost/tree_updater.h"
+#include "xgboost/logging.h"
+#include "xgboost/host_device_vector.h"
+
+#include "../gbm/gbtree_model.h"
 
 namespace xgboost {
 namespace predictor {
@@ -53,29 +55,34 @@ class CPUPredictor : public Predictor {
         << "size_leaf_vector is enforced to 0 so far";
     CHECK_EQ(preds.size(), p_fmat->Info().num_row_ * num_group);
     // start collecting the prediction
-    for (const auto &batch : p_fmat->GetRowBatches()) {
+    for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
       // parallel over local batch
       constexpr int kUnroll = 8;
       const auto nsize = static_cast<bst_omp_uint>(batch.Size());
       const bst_omp_uint rest = nsize % kUnroll;
+      // Pull to host before entering omp block, as this is not thread safe.
+      batch.data.HostVector();
+      batch.offset.HostVector();
+      if (nsize >= kUnroll) {
 #pragma omp parallel for schedule(static)
-      for (bst_omp_uint i = 0; i < nsize - rest; i += kUnroll) {
-        const int tid = omp_get_thread_num();
-        RegTree::FVec& feats = thread_temp[tid];
-        int64_t ridx[kUnroll];
-        SparsePage::Inst inst[kUnroll];
-        for (int k = 0; k < kUnroll; ++k) {
-          ridx[k] = static_cast<int64_t>(batch.base_rowid + i + k);
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          inst[k] = batch[i + k];
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          for (int gid = 0; gid < num_group; ++gid) {
-            const size_t offset = ridx[k] * num_group + gid;
-            preds[offset] += this->PredValue(
-                inst[k], model.trees, model.tree_info, gid,
-                info.GetRoot(ridx[k]), &feats, tree_begin, tree_end);
+        for (bst_omp_uint i = 0; i < nsize - rest; i += kUnroll) {
+          const int tid = omp_get_thread_num();
+          RegTree::FVec& feats = thread_temp[tid];
+          int64_t ridx[kUnroll];
+          SparsePage::Inst inst[kUnroll];
+          for (int k = 0; k < kUnroll; ++k) {
+            ridx[k] = static_cast<int64_t>(batch.base_rowid + i + k);
+          }
+          for (int k = 0; k < kUnroll; ++k) {
+            inst[k] = batch[i + k];
+          }
+          for (int k = 0; k < kUnroll; ++k) {
+            for (int gid = 0; gid < num_group; ++gid) {
+              const size_t offset = ridx[k] * num_group + gid;
+              preds[offset] += this->PredValue(
+                  inst[k], model.trees, model.tree_info, gid,
+                  info.GetRoot(ridx[k]), &feats, tree_begin, tree_end);
+            }
           }
         }
       }
@@ -134,7 +141,7 @@ class CPUPredictor : public Predictor {
     } else {
       if (!base_margin.empty()) {
         std::ostringstream oss;
-        oss << "Warning: Ignoring the base margin, since it has incorrect length. "
+        oss << "Ignoring the base margin, since it has incorrect length. "
             << "The base margin must be an array of length ";
         if (model.param.num_output_group > 1) {
           oss << "[num_class] * [number of data points], i.e. "
@@ -145,7 +152,7 @@ class CPUPredictor : public Predictor {
         }
         oss << "Instead, all data points will use "
             << "base_score = " << model.base_margin;
-        LOG(INFO) << oss.str();
+        LOG(WARNING) << oss.str();
       }
       std::fill(out_preds_h.begin(), out_preds_h.end(), model.base_margin);
     }
@@ -230,7 +237,7 @@ class CPUPredictor : public Predictor {
     std::vector<bst_float>& preds = *out_preds;
     preds.resize(info.num_row_ * ntree_limit);
     // start collecting the prediction
-    for (const auto &batch : p_fmat->GetRowBatches()) {
+    for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
       // parallel over local batch
       const auto nsize = static_cast<bst_omp_uint>(batch.Size());
 #pragma omp parallel for schedule(static)
@@ -276,7 +283,7 @@ class CPUPredictor : public Predictor {
     }
     const std::vector<bst_float>& base_margin = info.base_margin_.HostVector();
     // start collecting the contributions
-    for (const auto &batch : p_fmat->GetRowBatches()) {
+    for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
       // parallel over local batch
       const auto nsize = static_cast<bst_omp_uint>(batch.Size());
 #pragma omp parallel for schedule(static)

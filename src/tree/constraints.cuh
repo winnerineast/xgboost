@@ -1,171 +1,91 @@
 /*!
  * Copyright 2019 XGBoost contributors
+ *
+ * \file Various constraints used in GPU_Hist.
  */
 #ifndef XGBOOST_TREE_CONSTRAINTS_H_
 #define XGBOOST_TREE_CONSTRAINTS_H_
 
 #include <dmlc/json.h>
-#include <xgboost/logging.h>
 
 #include <cinttypes>
-#include <iterator>
 #include <vector>
-#include <string>
-#include <iostream>
-#include <sstream>
-#include <set>
 
 #include "param.h"
-#include "../common/span.h"
+#include "xgboost/span.h"
+#include "../common/bitfield.h"
 #include "../common/device_helpers.cuh"
-
-#include <bitset>
 
 namespace xgboost {
 
-__forceinline__ __device__ unsigned long long AtomicOr(unsigned long long* address,
-                                                       unsigned long long val) {
-  unsigned long long int old = *address, assumed;  // NOLINT
-  do {
-    assumed = old;
-    old = atomicCAS(address, assumed, val | assumed);
-  } while (assumed != old);
-
-  return old;
-}
-
-__forceinline__ __device__ unsigned long long AtomicAnd(unsigned long long* address,
-                                                        unsigned long long val) {
-  unsigned long long int old = *address, assumed;  // NOLINT
-  do {
-    assumed = old;
-    old = atomicCAS(address, assumed, val & assumed);
-  } while (assumed != old);
-
-  return old;
-}
-
-/*!
- * \brief A non-owning type with auxiliary methods defined for manipulating bits.
- */
-struct BitField {
-  using value_type = uint64_t;
-
-  static value_type constexpr kValueSize = sizeof(value_type) * 8;
-  static value_type constexpr kOne = 1UL;  // force uint64_t
-  static_assert(kValueSize == 64, "uint64_t should be of 64 bits.");
-
-  struct Pos {
-    value_type int_pos {0};
-    value_type bit_pos {0};
-  };
-
-  common::Span<value_type> bits_;
-
- public:
-  BitField() = default;
-  XGBOOST_DEVICE BitField(common::Span<value_type> bits) : bits_{bits} {}
-  XGBOOST_DEVICE BitField(BitField const& other) : bits_{other.bits_} {}
-
-  static size_t ComputeStorageSize(size_t size) {
-    auto pos = ToBitPos(size);
-    if (size < kValueSize) {
-      return 1;
+// This class implements monotonic constraints, L1, L2 regularization.
+struct ValueConstraint {
+  double lower_bound;
+  double upper_bound;
+  XGBOOST_DEVICE ValueConstraint()
+      : lower_bound(-std::numeric_limits<double>::max()),
+        upper_bound(std::numeric_limits<double>::max()) {}
+  inline static void Init(tree::TrainParam *param, unsigned num_feature) {
+    param->monotone_constraints.resize(num_feature, 0);
+  }
+  template <typename ParamT>
+  XGBOOST_DEVICE inline double CalcWeight(const ParamT &param, tree::GradStats stats) const {
+    double w = xgboost::tree::CalcWeight(param, stats);
+    if (w < lower_bound) {
+      return lower_bound;
     }
+    if (w > upper_bound) {
+      return upper_bound;
+    }
+    return w;
+  }
 
-    if (pos.bit_pos != 0) {
-      return pos.int_pos + 2;
+  template <typename ParamT>
+  XGBOOST_DEVICE inline double CalcGain(const ParamT &param, tree::GradStats stats) const {
+    return tree::CalcGainGivenWeight<ParamT, float>(param, stats.sum_grad, stats.sum_hess,
+                                                    CalcWeight(param, stats));
+  }
+
+  template <typename ParamT>
+  XGBOOST_DEVICE inline double CalcSplitGain(const ParamT &param, int constraint,
+                                             tree::GradStats left, tree::GradStats right) const {
+    const double negative_infinity = -std::numeric_limits<double>::infinity();
+    double wleft = CalcWeight(param, left);
+    double wright = CalcWeight(param, right);
+    double gain =
+      tree::CalcGainGivenWeight<ParamT, float>(param, left.sum_grad, left.sum_hess, wleft) +
+      tree::CalcGainGivenWeight<ParamT, float>(param, right.sum_grad, right.sum_hess, wright);
+    if (constraint == 0) {
+      return gain;
+    } else if (constraint > 0) {
+      return wleft <= wright ? gain : negative_infinity;
     } else {
-      return pos.int_pos + 1;
+      return wleft >= wright ? gain : negative_infinity;
     }
   }
-  XGBOOST_DEVICE static Pos ToBitPos(value_type pos) {
-    Pos pos_v;
-    if (pos == 0) {
-      return pos_v;
+
+  inline void SetChild(const tree::TrainParam &param, bst_uint split_index,
+                       tree::GradStats left, tree::GradStats right, ValueConstraint *cleft,
+                       ValueConstraint *cright) {
+    int c = param.monotone_constraints.at(split_index);
+    *cleft = *this;
+    *cright = *this;
+    if (c == 0) {
+      return;
     }
-    pos_v.int_pos =  pos / kValueSize;
-    pos_v.bit_pos =  pos % kValueSize;
-    return pos_v;
-  }
-
-  __device__ BitField& operator|=(BitField const& rhs) {
-    auto tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t min_size = min(bits_.size(), rhs.bits_.size());
-    if (tid < min_size) {
-      bits_[tid] |= rhs.bits_[tid];
+    double wleft = CalcWeight(param, left);
+    double wright = CalcWeight(param, right);
+    double mid = (wleft + wright) / 2;
+    CHECK(!std::isnan(mid));
+    if (c < 0) {
+      cleft->lower_bound = mid;
+      cright->upper_bound = mid;
+    } else {
+      cleft->upper_bound = mid;
+      cright->lower_bound = mid;
     }
-    return *this;
-  }
-  __device__ BitField& operator&=(BitField const& rhs) {
-    size_t min_size = min(bits_.size(), rhs.bits_.size());
-    auto tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < min_size) {
-      bits_[tid] &= rhs.bits_[tid];
-    }
-    return *this;
-  }
-
-  XGBOOST_DEVICE size_t Size() const { return kValueSize * bits_.size(); }
-
-  __device__ void Set(value_type pos) {
-    Pos pos_v = ToBitPos(pos);
-    value_type& value = bits_[pos_v.int_pos];
-    value_type set_bit = kOne << (kValueSize - pos_v.bit_pos - kOne);
-    static_assert(sizeof(unsigned long long int) == sizeof(value_type), "");
-    AtomicOr(reinterpret_cast<unsigned long long*>(&value), set_bit);
-  }
-  __device__ void Clear(value_type pos) {
-    Pos pos_v = ToBitPos(pos);
-    value_type& value = bits_[pos_v.int_pos];
-    value_type clear_bit = ~(kOne << (kValueSize - pos_v.bit_pos - kOne));
-    static_assert(sizeof(unsigned long long int) == sizeof(value_type), "");
-    AtomicAnd(reinterpret_cast<unsigned long long*>(&value), clear_bit);
-  }
-
-  XGBOOST_DEVICE bool Check(Pos pos_v) const {
-    value_type value = bits_[pos_v.int_pos];
-    value_type const test_bit = kOne << (kValueSize - pos_v.bit_pos - kOne);
-    value_type result = test_bit & value;
-    return static_cast<bool>(result);
-  }
-  XGBOOST_DEVICE bool Check(value_type pos) const {
-    Pos pos_v = ToBitPos(pos);
-    return Check(pos_v);
-  }
-
-  friend std::ostream& operator<<(std::ostream& os, BitField field) {
-    os << "Bits " << "storage size: " << field.bits_.size() << "\n";
-    for (size_t i = 0; i < field.bits_.size(); ++i) {
-      std::bitset<BitField::kValueSize> set(field.bits_[i]);
-      os << set << "\n";
-    }
-    return os;
   }
 };
-
-inline void PrintDeviceBits(std::string name, BitField field) {
-  std::cout << "Bits: " << name << std::endl;
-  std::vector<BitField::value_type> h_field_bits(field.bits_.size());
-  thrust::copy(thrust::device_ptr<BitField::value_type>(field.bits_.data()),
-               thrust::device_ptr<BitField::value_type>(field.bits_.data() + field.bits_.size()),
-               h_field_bits.data());
-  BitField h_field;
-  h_field.bits_ = {h_field_bits.data(), h_field_bits.data() + h_field_bits.size()};
-  std::cout << h_field;
-}
-
-inline void PrintDeviceStorage(std::string name, common::Span<int32_t> list) {
-  std::cout << name << std::endl;
-  std::vector<int32_t> h_list(list.size());
-  thrust::copy(thrust::device_ptr<int32_t>(list.data()),
-               thrust::device_ptr<int32_t>(list.data() + list.size()),
-               h_list.data());
-  for (auto v : h_list) {
-    std::cout << v << ", ";
-  }
-  std::cout << std::endl;
-}
 
 // Feature interaction constraints built for GPU Hist updater.
 struct FeatureInteractionConstraint {
@@ -188,32 +108,32 @@ struct FeatureInteractionConstraint {
    *
    * d_sets_ptr_:                        |0, 1, 3, 4|
    */
-  dh::device_vector<int32_t> d_sets_;
-  common::Span<int32_t> s_sets_;
-  dh::device_vector<int32_t> d_sets_ptr_;
-  common::Span<int32_t> s_sets_ptr_;
+  dh::device_vector<bst_feature_t> d_sets_;
+  common::Span<bst_feature_t> s_sets_;
+  dh::device_vector<size_t> d_sets_ptr_;
+  common::Span<size_t> s_sets_ptr_;
 
   // Allowed features attached to each node, have n_nodes bitfields,
   // each of size n_features.
-  std::vector<dh::device_vector<BitField::value_type>> node_constraints_storage_;
-  std::vector<BitField> node_constraints_;
-  common::Span<BitField> s_node_constraints_;
+  std::vector<dh::device_vector<LBitField64::value_type>> node_constraints_storage_;
+  std::vector<LBitField64> node_constraints_;
+  common::Span<LBitField64> s_node_constraints_;
 
   // buffer storing return feature list from Query, of size n_features.
-  dh::device_vector<int32_t> result_buffer_;
-  common::Span<int32_t> s_result_buffer_;
+  dh::device_vector<bst_feature_t> result_buffer_;
+  common::Span<bst_feature_t> s_result_buffer_;
 
   // Temp buffers, one bit for each possible feature.
-  dh::device_vector<BitField::value_type> output_buffer_bits_storage_;
-  BitField output_buffer_bits_;
-  dh::device_vector<BitField::value_type> input_buffer_bits_storage_;
-  BitField input_buffer_bits_;
+  dh::device_vector<LBitField64::value_type> output_buffer_bits_storage_;
+  LBitField64 output_buffer_bits_;
+  dh::device_vector<LBitField64::value_type> input_buffer_bits_storage_;
+  LBitField64 input_buffer_bits_;
   /*
    * Combined features from all interaction sets that one feature belongs to.
    * For an input with [[0, 1], [1, 2]], the feature 1 belongs to sets {0, 1}
    */
-  dh::device_vector<BitField::value_type> d_feature_buffer_storage_;
-  BitField feature_buffer_;  // of Size n features.
+  dh::device_vector<LBitField64::value_type> d_feature_buffer_storage_;
+  LBitField64 feature_buffer_;  // of Size n features.
 
   // Clear out all temp buffers except for `feature_buffer_', which is
   // handled in `Split'.
@@ -229,7 +149,7 @@ struct FeatureInteractionConstraint {
   /*! \brief Reset before constructing a new tree. */
   void Reset();
   /*! \brief Return a list of features given node id */
-  common::Span<int32_t> QueryNode(int32_t nid);
+  common::Span<bst_feature_t> QueryNode(int32_t nid);
   /*!
    * \brief Return a list of selected features from given feature_list and node id.
    *
@@ -239,9 +159,9 @@ struct FeatureInteractionConstraint {
    * \return A list of features picked from `feature_list' that conform to constraints in
    * node.
    */
-  common::Span<int32_t> Query(common::Span<int32_t> feature_list, int32_t nid);
+  common::Span<bst_feature_t> Query(common::Span<bst_feature_t> feature_list, int32_t nid);
   /*! \brief Apply split for node_id. */
-  void Split(int32_t node_id, int32_t feature_id, int32_t left_id, int32_t right_id);
+  void Split(bst_node_t node_id, bst_feature_t feature_id, bst_node_t left_id, bst_node_t right_id);
 };
 
 }      // namespace xgboost

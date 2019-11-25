@@ -19,8 +19,8 @@ using MemoryFixSizeBuffer = rabit::utils::MemoryFixSizeBuffer;
 using MemoryBufferStream = rabit::utils::MemoryBufferStream;
 
 /*!
- * \brief Input stream that support additional PeekRead
- *  operation, besides read.
+ * \brief Input stream that support additional PeekRead operation,
+ *  besides read.
  */
 class PeekableInStream : public dmlc::Stream {
  public:
@@ -70,6 +70,10 @@ class PeekableInStream : public dmlc::Stream {
   /*! \brief internal buffer */
   std::string buffer_;
 };
+
+// Optimized for consecutive file loading in unix like systime.
+std::string LoadSequentialFile(std::string fname);
+
 }  // namespace common
 }  // namespace xgboost
 #endif  // XGBOOST_COMMON_IO_H_

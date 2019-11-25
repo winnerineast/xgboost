@@ -58,6 +58,16 @@ typedef struct {  // NOLINT(*)
   float* value;
 } XGBoostBatchCSR;
 
+/*!
+ * \brief Return the version of the XGBoost library being currently used.
+ *
+ *  The output variable is only written if it's not NULL.
+ *
+ * \param major Store the major version number
+ * \param minor Store the minor version number
+ * \param patch Store the patch (revision) number
+ */
+XGB_DLL void XGBoostVersion(int* major, int* minor, int* patch);
 
 /*!
  * \brief Callback to set the data to handle,
@@ -273,8 +283,9 @@ XGB_DLL int XGDMatrixSetUIntInfo(DMatrixHandle handle,
                                  const char *field,
                                  const unsigned *array,
                                  bst_ulong len);
+
 /*!
- * \brief set label of the training matrix
+ * \brief (deprecated) Use XGDMatrixSetUIntInfo instead. Set group of the training matrix
  * \param handle a instance of data matrix
  * \param group pointer to group size
  * \param len length of array
@@ -283,8 +294,9 @@ XGB_DLL int XGDMatrixSetUIntInfo(DMatrixHandle handle,
 XGB_DLL int XGDMatrixSetGroup(DMatrixHandle handle,
                               const unsigned *group,
                               bst_ulong len);
+
 /*!
- * \brief get float info vector from matrix
+ * \brief get float info vector from matrix.
  * \param handle a instance of data matrix
  * \param field field name
  * \param out_len used to set result length

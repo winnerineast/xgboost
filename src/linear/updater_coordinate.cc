@@ -24,12 +24,11 @@ DMLC_REGISTRY_FILE_TAG(updater_coordinate);
 class CoordinateUpdater : public LinearUpdater {
  public:
   // set training parameter
-  void Init(
-      const std::vector<std::pair<std::string, std::string> > &args) override {
+  void Configure(Args const& args) override {
     const std::vector<std::pair<std::string, std::string> > rest {
-      tparam_.InitAllowUnknown(args)
+      tparam_.UpdateAllowUnknown(args)
     };
-    cparam_.InitAllowUnknown(rest);
+    cparam_.UpdateAllowUnknown(rest);
     selector_.reset(FeatureSelector::Create(tparam_.feature_selector));
     monitor_.Init("CoordinateUpdater");
   }

@@ -1,5 +1,6 @@
-// Copyright by Contributors
+// Copyright (c) 2019 by Contributors
 #include <gtest/gtest.h>
+#include <xgboost/version_config.h>
 #include <xgboost/c_api.h>
 #include <xgboost/data.h>
 
@@ -20,7 +21,7 @@ TEST(c_api, XGDMatrixCreateFromMatDT) {
   ASSERT_EQ(info.num_row_, 3);
   ASSERT_EQ(info.num_nonzero_, 6);
 
-  for (const auto &batch : (*dmat)->GetRowBatches()) {
+  for (const auto &batch : (*dmat)->GetBatches<xgboost::SparsePage>()) {
     ASSERT_EQ(batch[0][0].fvalue, 0.0f);
     ASSERT_EQ(batch[0][1].fvalue, -4.0f);
     ASSERT_EQ(batch[2][0].fvalue, 3.0f);
@@ -52,14 +53,20 @@ TEST(c_api, XGDMatrixCreateFromMat_omp) {
     ASSERT_EQ(info.num_row_, row);
     ASSERT_EQ(info.num_nonzero_, num_cols * row - num_missing);
 
-    for (const auto &batch : (*dmat)->GetRowBatches()) {
-      for (int i = 0; i < batch.Size(); i++) {
+    for (const auto &batch : (*dmat)->GetBatches<xgboost::SparsePage>()) {
+      for (size_t i = 0; i < batch.Size(); i++) {
         auto inst = batch[i];
-        for (int j = 0; i < inst.size(); i++) {
-          ASSERT_EQ(inst[j].fvalue, 1.5);
+        for (auto e : inst) {
+          ASSERT_EQ(e.fvalue, 1.5);
         }
       }
     }
     delete dmat;
   }
+}
+
+TEST(c_api, Version) {
+  int patch {0};
+  XGBoostVersion(NULL, NULL, &patch);  // NOLINT
+  ASSERT_EQ(patch, XGBOOST_VER_PATCH);
 }

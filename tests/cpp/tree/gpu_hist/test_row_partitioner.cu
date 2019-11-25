@@ -11,15 +11,16 @@ namespace tree {
 
 void TestSortPosition(const std::vector<int>& position_in, int left_idx,
                       int right_idx) {
+  dh::safe_cuda(cudaSetDevice(0));
   std::vector<int64_t> left_count = {
       std::count(position_in.begin(), position_in.end(), left_idx)};
-  thrust::device_vector<int64_t> d_left_count = left_count;
-  thrust::device_vector<int> position = position_in;
-  thrust::device_vector<int> position_out(position.size());
+  dh::caching_device_vector<int64_t> d_left_count = left_count;
+  dh::caching_device_vector<int> position = position_in;
+  dh::caching_device_vector<int> position_out(position.size());
 
-  thrust::device_vector<RowPartitioner::RowIndexT> ridx(position.size());
+  dh::caching_device_vector<RowPartitioner::RowIndexT> ridx(position.size());
   thrust::sequence(ridx.begin(), ridx.end());
-  thrust::device_vector<RowPartitioner::RowIndexT> ridx_out(ridx.size());
+  dh::caching_device_vector<RowPartitioner::RowIndexT> ridx_out(ridx.size());
   RowPartitioner rp(0,10);
   rp.SortPosition(
       common::Span<int>(position.data().get(), position.size()),
@@ -90,11 +91,11 @@ void TestUpdatePosition() {
   EXPECT_EQ(rp.GetRows(3).size(), 2);
   EXPECT_EQ(rp.GetRows(4).size(), 3);
   // Check position is as expected
-  EXPECT_EQ(rp.GetPositionHost(), std::vector<RowPartitioner::TreePositionT>({3,3,4,4,4,2,2,2,2,2}));
+  EXPECT_EQ(rp.GetPositionHost(), std::vector<bst_node_t>({3,3,4,4,4,2,2,2,2,2}));
 }
 
 TEST(RowPartitioner, Basic) { TestUpdatePosition(); }
-  
+
 void TestFinalise() {
   const int kNumRows = 10;
   RowPartitioner rp(0, kNumRows);

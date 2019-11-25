@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "constraints.h"
 #include "./param.h"
 #include "./split_evaluator.h"
 #include "../common/random.h"
@@ -65,7 +66,6 @@ class MemStackAllocator {
 
 namespace tree {
 
-using xgboost::common::HistCutMatrix;
 using xgboost::common::GHistIndexMatrix;
 using xgboost::common::GHistIndexBlockMatrix;
 using xgboost::common::GHistIndexRow;
@@ -79,7 +79,7 @@ using xgboost::common::Column;
 /*! \brief construct a tree using quantized feature values */
 class QuantileHistMaker: public TreeUpdater {
  public:
-  void Init(const std::vector<std::pair<std::string, std::string> >& args) override;
+  void Configure(const Args& args) override;
 
   void Update(HostDeviceVector<GradientPair>* gpair,
               DMatrix* dmat,
@@ -87,6 +87,10 @@ class QuantileHistMaker: public TreeUpdater {
 
   bool UpdatePredictionCache(const DMatrix* data,
                              HostDeviceVector<bst_float>* out_preds) override;
+
+  char const* Name() const override {
+    return "grow_quantile_histmaker";
+  }
 
  protected:
   // training parameter
@@ -120,10 +124,11 @@ class QuantileHistMaker: public TreeUpdater {
     // constructor
     explicit Builder(const TrainParam& param,
                      std::unique_ptr<TreeUpdater> pruner,
-                     std::unique_ptr<SplitEvaluator> spliteval)
+                     std::unique_ptr<SplitEvaluator> spliteval,
+                     FeatureInteractionConstraintHost int_constraints_)
       : param_(param), pruner_(std::move(pruner)),
-        spliteval_(std::move(spliteval)), p_last_tree_(nullptr),
-        p_last_fmat_(nullptr) {
+        spliteval_(std::move(spliteval)), interaction_constraints_{int_constraints_},
+        p_last_tree_(nullptr), p_last_fmat_(nullptr) {
       builder_monitor_.Init("Quantile::Builder");
     }
     // update one tree, growing
@@ -223,12 +228,12 @@ class QuantileHistMaker: public TreeUpdater {
                         bst_uint fid,
                         bst_uint nodeID);
 
-    void ExpandWithDepthWidth(const GHistIndexMatrix &gmat,
-                              const GHistIndexBlockMatrix &gmatb,
-                              const ColumnMatrix &column_matrix,
-                              DMatrix *p_fmat,
-                              RegTree *p_tree,
-                              const std::vector<GradientPair> &gpair_h);
+    void ExpandWithDepthWise(const GHistIndexMatrix &gmat,
+                             const GHistIndexBlockMatrix &gmatb,
+                             const ColumnMatrix &column_matrix,
+                             DMatrix *p_fmat,
+                             RegTree *p_tree,
+                             const std::vector<GradientPair> &gpair_h);
 
     void BuildLocalHistograms(int *starting_index,
                               int *sync_count,
@@ -293,6 +298,7 @@ class QuantileHistMaker: public TreeUpdater {
     GHistBuilder hist_builder_;
     std::unique_ptr<TreeUpdater> pruner_;
     std::unique_ptr<SplitEvaluator> spliteval_;
+    FeatureInteractionConstraintHost interaction_constraints_;
 
     // back pointers to tree and data matrix
     const RegTree* p_last_tree_;
@@ -318,6 +324,7 @@ class QuantileHistMaker: public TreeUpdater {
   std::unique_ptr<Builder> builder_;
   std::unique_ptr<TreeUpdater> pruner_;
   std::unique_ptr<SplitEvaluator> spliteval_;
+  FeatureInteractionConstraintHost int_constraint_;
 };
 
 }  // namespace tree

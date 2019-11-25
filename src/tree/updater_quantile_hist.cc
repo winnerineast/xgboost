@@ -22,6 +22,7 @@
 #include "./param.h"
 #include "./updater_quantile_hist.h"
 #include "./split_evaluator.h"
+#include "constraints.h"
 #include "../common/random.h"
 #include "../common/hist_util.h"
 #include "../common/row_set.h"
@@ -32,13 +33,13 @@ namespace tree {
 
 DMLC_REGISTRY_FILE_TAG(updater_quantile_hist);
 
-void QuantileHistMaker::Init(const std::vector<std::pair<std::string, std::string> >& args) {
+void QuantileHistMaker::Configure(const Args& args) {
   // initialize pruner
   if (!pruner_) {
     pruner_.reset(TreeUpdater::Create("prune", tparam_));
   }
-  pruner_->Init(args);
-  param_.InitAllowUnknown(args);
+  pruner_->Configure(args);
+  param_.UpdateAllowUnknown(args);
   is_gmat_initialized_ = false;
 
   // initialise the split evaluator
@@ -65,12 +66,14 @@ void QuantileHistMaker::Update(HostDeviceVector<GradientPair> *gpair,
   // rescale learning rate according to size of trees
   float lr = param_.learning_rate;
   param_.learning_rate = lr / trees.size();
+  int_constraint_.Configure(param_, dmat->Info().num_col_);
   // build tree
   if (!builder_) {
     builder_.reset(new Builder(
         param_,
         std::move(pruner_),
-        std::unique_ptr<SplitEvaluator>(spliteval_->GetHostClone())));
+        std::unique_ptr<SplitEvaluator>(spliteval_->GetHostClone()),
+        int_constraint_));
   }
   for (auto tree : trees) {
     builder_->Update(gmat_, gmatb_, column_matrix_, gpair, dmat, tree);
@@ -170,6 +173,8 @@ void QuantileHistMaker::Builder::BuildNodeStats(
       auto parent_split_feature_id = snode_[parent_id].best.SplitIndex();
       spliteval_->AddSplit(parent_id, left_sibling_id, nid, parent_split_feature_id,
                            snode_[left_sibling_id].weight, snode_[nid].weight);
+      interaction_constraints_.Split(parent_id, parent_split_feature_id,
+                                     left_sibling_id, nid);
     }
   }
   builder_monitor_.Stop("BuildNodeStats");
@@ -205,7 +210,7 @@ void QuantileHistMaker::Builder::EvaluateSplits(
   }
 }
 
-void QuantileHistMaker::Builder::ExpandWithDepthWidth(
+void QuantileHistMaker::Builder::ExpandWithDepthWise(
   const GHistIndexMatrix &gmat,
   const GHistIndexBlockMatrix &gmatb,
   const ColumnMatrix &column_matrix,
@@ -298,6 +303,7 @@ void QuantileHistMaker::Builder::ExpandWithLossGuide(
       bst_uint featureid = snode_[nid].best.SplitIndex();
       spliteval_->AddSplit(nid, cleft, cright, featureid,
                            snode_[cleft].weight, snode_[cright].weight);
+      interaction_constraints_.Split(nid, featureid, cleft, cright);
 
       this->EvaluateSplit(cleft, gmat, hist_, *p_fmat, *p_tree);
       this->EvaluateSplit(cright, gmat, hist_, *p_fmat, *p_tree);
@@ -325,13 +331,14 @@ void QuantileHistMaker::Builder::Update(const GHistIndexMatrix& gmat,
   const std::vector<GradientPair>& gpair_h = gpair->ConstHostVector();
 
   spliteval_->Reset();
+  interaction_constraints_.Reset();
 
   this->InitData(gmat, gpair_h, *p_fmat, *p_tree);
 
   if (param_.grow_policy == TrainParam::kLossGuide) {
     ExpandWithLossGuide(gmat, gmatb, column_matrix, p_fmat, p_tree, gpair_h);
   } else {
-    ExpandWithDepthWidth(gmat, gmatb, column_matrix, p_fmat, p_tree, gpair_h);
+    ExpandWithDepthWise(gmat, gmatb, column_matrix, p_fmat, p_tree, gpair_h);
   }
 
   for (int nid = 0; nid < p_tree->param.num_nodes; ++nid) {
@@ -408,7 +415,7 @@ void QuantileHistMaker::Builder::InitData(const GHistIndexMatrix& gmat,
     // clear local prediction cache
     leaf_value_cache_.clear();
     // initialize histogram collection
-    uint32_t nbins = gmat.cut.row_ptr.back();
+    uint32_t nbins = gmat.cut.Ptrs().back();
     hist_.Init(nbins);
 
     // initialize histogram builder
@@ -457,7 +464,7 @@ void QuantileHistMaker::Builder::InitData(const GHistIndexMatrix& gmat,
       }
 
       bool has_neg_hess = false;
-      for (size_t tid = 0; tid < this->nthread_; ++tid) {
+      for (int32_t tid = 0; tid < this->nthread_; ++tid) {
         if (p_buff[tid]) {
           has_neg_hess = true;
         }
@@ -494,7 +501,7 @@ void QuantileHistMaker::Builder::InitData(const GHistIndexMatrix& gmat,
     const size_t ncol = info.num_col_;
     const size_t nnz = info.num_nonzero_;
     // number of discrete bins for feature 0
-    const uint32_t nbins_f0 = gmat.cut.row_ptr[1] - gmat.cut.row_ptr[0];
+    const uint32_t nbins_f0 = gmat.cut.Ptrs()[1] - gmat.cut.Ptrs()[0];
     if (nrow * ncol == nnz) {
       // dense data with zero-based indexing
       data_layout_ = kDenseDataZeroBased;
@@ -524,7 +531,7 @@ void QuantileHistMaker::Builder::InitData(const GHistIndexMatrix& gmat,
        choose the column that has a least positive number of discrete bins.
        For dense data (with no missing value),
        the sum of gradient histogram is equal to snode[nid] */
-    const std::vector<uint32_t>& row_ptr = gmat.cut.row_ptr;
+    const std::vector<uint32_t>& row_ptr = gmat.cut.Ptrs();
     const auto nfeature = static_cast<bst_uint>(row_ptr.size() - 1);
     uint32_t min_nbins_per_feature = 0;
     for (bst_uint i = 0; i < nfeature; ++i) {
@@ -561,8 +568,8 @@ void QuantileHistMaker::Builder::EvaluateSplit(const int nid,
   // start enumeration
   const MetaInfo& info = fmat.Info();
   auto p_feature_set = column_sampler_.GetFeatureSet(tree.GetDepth(nid));
-  const auto& feature_set = p_feature_set->HostVector();
-  const auto nfeature = static_cast<bst_uint>(feature_set.size());
+  auto const& feature_set = p_feature_set->HostVector();
+  const auto nfeature = static_cast<bst_feature_t>(feature_set.size());
   const auto nthread = static_cast<bst_omp_uint>(this->nthread_);
   best_split_tloc_.resize(nthread);
 #pragma omp parallel for schedule(static) num_threads(nthread)
@@ -576,9 +583,7 @@ void QuantileHistMaker::Builder::EvaluateSplit(const int nid,
     const auto feature_id = static_cast<bst_uint>(feature_set[i]);
     const auto tid = static_cast<unsigned>(omp_get_thread_num());
     const auto node_id = static_cast<bst_uint>(nid);
-    // Narrow search space by dropping features that are not feasible under the
-    // given set of constraints (e.g. feature interaction constraints)
-    if (spliteval_->CheckFeatureConstraint(node_id, feature_id)) {
+    if (interaction_constraints_.Query(node_id, feature_id)) {
       this->EnumerateSplit(-1, gmat, node_hist, snode_[nid], info,
                            &best_split_tloc_[tid], feature_id, node_id);
       this->EnumerateSplit(+1, gmat, node_hist, snode_[nid], info,
@@ -620,15 +625,15 @@ void QuantileHistMaker::Builder::ApplySplit(int nid,
   const bool default_left = (*p_tree)[nid].DefaultLeft();
   const bst_uint fid = (*p_tree)[nid].SplitIndex();
   const bst_float split_pt = (*p_tree)[nid].SplitCond();
-  const uint32_t lower_bound = gmat.cut.row_ptr[fid];
-  const uint32_t upper_bound = gmat.cut.row_ptr[fid + 1];
+  const uint32_t lower_bound = gmat.cut.Ptrs()[fid];
+  const uint32_t upper_bound = gmat.cut.Ptrs()[fid + 1];
   int32_t split_cond = -1;
   // convert floating-point split_pt into corresponding bin_id
   // split_cond = -1 indicates that split_pt is less than all known cut points
   CHECK_LT(upper_bound,
            static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
   for (uint32_t i = lower_bound; i < upper_bound; ++i) {
-    if (split_pt == gmat.cut.cut[i]) {
+    if (split_pt == gmat.cut.Values()[i]) {
       split_cond = static_cast<int32_t>(i);
     }
   }
@@ -795,7 +800,7 @@ void QuantileHistMaker::Builder::InitNewNode(int nid,
     GHistRow hist = hist_[nid];
     if (tree[nid].IsRoot()) {
       if (data_layout_ == kDenseDataZeroBased || data_layout_ == kDenseDataOneBased) {
-        const std::vector<uint32_t>& row_ptr = gmat.cut.row_ptr;
+        const std::vector<uint32_t>& row_ptr = gmat.cut.Ptrs();
         const uint32_t ibegin = row_ptr[fid_least_bins_];
         const uint32_t iend = row_ptr[fid_least_bins_ + 1];
         auto begin = hist.data();
@@ -843,8 +848,8 @@ void QuantileHistMaker::Builder::EnumerateSplit(int d_step,
   CHECK(d_step == +1 || d_step == -1);
 
   // aliases
-  const std::vector<uint32_t>& cut_ptr = gmat.cut.row_ptr;
-  const std::vector<bst_float>& cut_val = gmat.cut.cut;
+  const std::vector<uint32_t>& cut_ptr = gmat.cut.Ptrs();
+  const std::vector<bst_float>& cut_val = gmat.cut.Values();
 
   // statistics on both sides of split
   GradStats c;
@@ -894,7 +899,7 @@ void QuantileHistMaker::Builder::EnumerateSplit(int d_step,
               snode.root_gain);
           if (i == imin) {
             // for leftmost bin, left bound is the smallest feature value
-            split_pt = gmat.cut.min_val[fid];
+            split_pt = gmat.cut.MinValues()[fid];
           } else {
             split_pt = cut_val[i - 1];
           }

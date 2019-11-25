@@ -6,11 +6,6 @@
  */
 #include <dmlc/omp.h>
 #include <dmlc/parameter.h>
-#include <dmlc/timer.h>
-#include <xgboost/logging.h>
-#include <xgboost/gbm.h>
-#include <xgboost/predictor.h>
-#include <xgboost/tree_updater.h>
 
 #include <vector>
 #include <memory>
@@ -19,11 +14,16 @@
 #include <limits>
 #include <algorithm>
 
-#include "../common/common.h"
-#include "../common/host_device_vector.h"
-#include "../common/random.h"
+#include "xgboost/logging.h"
+#include "xgboost/gbm.h"
+#include "xgboost/predictor.h"
+#include "xgboost/tree_updater.h"
+#include "xgboost/host_device_vector.h"
+
 #include "gbtree.h"
 #include "gbtree_model.h"
+#include "../common/common.h"
+#include "../common/random.h"
 #include "../common/timer.h"
 
 
@@ -32,12 +32,9 @@ namespace gbm {
 
 DMLC_REGISTRY_FILE_TAG(gbtree);
 
-void GBTree::Configure(const std::vector<std::pair<std::string, std::string> >& cfg) {
+void GBTree::Configure(const Args& cfg) {
   this->cfg_ = cfg;
-  tparam_.InitAllowUnknown(cfg);
-  std::string updater_seq = tparam_.updater_seq;
-
-  ConfigureUpdaters({cfg.begin(), cfg.cend()});
+  tparam_.UpdateAllowUnknown(cfg);
 
   model_.Configure(cfg);
 
@@ -46,21 +43,74 @@ void GBTree::Configure(const std::vector<std::pair<std::string, std::string> >& 
     model_.InitTreesToUpdate();
   }
 
-  // configure predictor
-  predictor_ = std::unique_ptr<Predictor>(
-      Predictor::Create(tparam_.predictor, this->learner_param_));
-  predictor_->Init(cfg, cache_);
+  // configure predictors
+  if (!cpu_predictor_) {
+    cpu_predictor_ = std::unique_ptr<Predictor>(
+        Predictor::Create("cpu_predictor", this->learner_param_));
+    cpu_predictor_->Configure(cfg, cache_);
+  }
+#if defined(XGBOOST_USE_CUDA)
+  if (!gpu_predictor_) {
+    gpu_predictor_ = std::unique_ptr<Predictor>(
+        Predictor::Create("gpu_predictor", this->learner_param_));
+    gpu_predictor_->Configure(cfg, cache_);
+  }
+#endif  // defined(XGBOOST_USE_CUDA)
+
   monitor_.Init("GBTree");
+
+  specified_predictor_ = std::any_of(cfg.cbegin(), cfg.cend(),
+                   [](std::pair<std::string, std::string> const& arg) {
+                     return arg.first == "predictor";
+                   });
+  if (!specified_predictor_ && tparam_.tree_method == TreeMethod::kGPUHist) {
+    tparam_.predictor = "gpu_predictor";
+  }
+
+  specified_updater_ = std::any_of(cfg.cbegin(), cfg.cend(),
+                   [](std::pair<std::string, std::string> const& arg) {
+                     return arg.first == "updater";
+                   });
+  if (specified_updater_) {
+    LOG(WARNING) << "DANGER AHEAD: You have manually specified `updater` "
+        "parameter. The `tree_method` parameter will be ignored. "
+        "Incorrect sequence of updaters will produce undefined "
+        "behavior. For common uses, we recommend using "
+        "`tree_method` parameter instead.";
+  } else {
+    this->ConfigureUpdaters();
+    LOG(DEBUG) << "Using updaters: " << tparam_.updater_seq;
+  }
+
+  configured_ = true;
 }
 
-void GBTree::PerformTreeMethodHeuristic(DMatrix* p_train,
-                                        std::map<std::string, std::string> cfg) {
-  if (cfg.find("updater") != cfg.cend()) {
+// FIXME(trivialfis): This handles updaters and predictor.  Because the choice of updaters
+// depends on whether external memory is used and how large is dataset.  We can remove the
+// dependency on DMatrix once `hist` tree method can handle external memory so that we can
+// make it default.
+void GBTree::ConfigureWithKnownData(Args const& cfg, DMatrix* fmat) {
+  std::string updater_seq = tparam_.updater_seq;
+
+  this->PerformTreeMethodHeuristic(fmat);
+  this->ConfigureUpdaters();
+
+  // initialize the updaters only when needed.
+  if (updater_seq != tparam_.updater_seq) {
+    LOG(DEBUG) << "Using updaters: " << tparam_.updater_seq;
+    this->updaters_.clear();
+  }
+
+  this->InitUpdater(cfg);
+}
+
+void GBTree::PerformTreeMethodHeuristic(DMatrix* fmat) {
+  if (specified_updater_) {
     // This method is disabled when `updater` parameter is explicitly
     // set, since only experts are expected to do so.
     return;
   }
-
+  // tparam_ is set before calling this function.
   if (tparam_.tree_method != TreeMethod::kAuto) {
     return;
   }
@@ -71,11 +121,11 @@ void GBTree::PerformTreeMethodHeuristic(DMatrix* p_train,
       "Tree method is automatically selected to be 'approx' "
       "for distributed training.";
     tparam_.tree_method = TreeMethod::kApprox;
-  } else if (!p_train->SingleColBlock()) {
+  } else if (!fmat->SingleColBlock()) {
     LOG(WARNING) << "Tree method is automatically set to 'approx' "
                     "since external-memory data matrix is used.";
     tparam_.tree_method = TreeMethod::kApprox;
-  } else if (p_train->Info().num_row_ >= (4UL << 20UL)) {
+  } else if (fmat->Info().num_row_ >= (4UL << 20UL)) {
     /* Choose tree_method='approx' automatically for large data matrix */
     LOG(WARNING) << "Tree method is automatically selected to be "
         "'approx' for faster speed. To use old behavior "
@@ -84,27 +134,18 @@ void GBTree::PerformTreeMethodHeuristic(DMatrix* p_train,
     tparam_.tree_method = TreeMethod::kApprox;
   } else {
     tparam_.tree_method = TreeMethod::kExact;
-    tparam_.updater_seq = "grow_colmaker,prune";
   }
   LOG(DEBUG) << "Using tree method: " << static_cast<int>(tparam_.tree_method);
 }
 
-void GBTree::ConfigureUpdaters(const std::map<std::string, std::string>& cfg) {
+void GBTree::ConfigureUpdaters() {
   // `updater` parameter was manually specified
-  if (cfg.find("updater")  != cfg.cend()) {
-    LOG(WARNING) << "DANGER AHEAD: You have manually specified `updater` "
-        "parameter. The `tree_method` parameter will be ignored. "
-        "Incorrect sequence of updaters will produce undefined "
-        "behavior. For common uses, we recommend using "
-        "`tree_method` parameter instead.";
-    return;
-  }
-
   /* Choose updaters according to tree_method parameters */
   switch (tparam_.tree_method) {
     case TreeMethod::kAuto:
-      // Use heuristic to choose between 'exact' and 'approx'
-      // This choice is deferred to PerformTreeMethodHeuristic().
+      // Use heuristic to choose between 'exact' and 'approx' This
+      // choice is carried out in PerformTreeMethodHeuristic() before
+      // calling this function.
       break;
     case TreeMethod::kApprox:
       tparam_.updater_seq = "grow_histmaker,prune";
@@ -118,17 +159,10 @@ void GBTree::ConfigureUpdaters(const std::map<std::string, std::string>& cfg) {
           "single updater grow_quantile_histmaker.";
       tparam_.updater_seq = "grow_quantile_histmaker";
       break;
-    case TreeMethod::kGPUExact:
-      this->AssertGPUSupport();
-      tparam_.updater_seq = "grow_gpu,prune";
-      if (cfg.find("predictor") == cfg.cend()) {
-        tparam_.predictor = "gpu_predictor";
-      }
-      break;
     case TreeMethod::kGPUHist:
       this->AssertGPUSupport();
       tparam_.updater_seq = "grow_gpu_hist";
-      if (cfg.find("predictor") == cfg.cend()) {
+      if (!specified_predictor_) {
         tparam_.predictor = "gpu_predictor";
       }
       break;
@@ -141,17 +175,9 @@ void GBTree::ConfigureUpdaters(const std::map<std::string, std::string>& cfg) {
 void GBTree::DoBoost(DMatrix* p_fmat,
                      HostDeviceVector<GradientPair>* in_gpair,
                      ObjFunction* obj) {
-  std::string updater_seq = tparam_.updater_seq;
-  this->PerformTreeMethodHeuristic(p_fmat, {this->cfg_.begin(), this->cfg_.end()});
-  this->ConfigureUpdaters({this->cfg_.begin(), this->cfg_.end()});
-  LOG(DEBUG) << "Using updaters: " << tparam_.updater_seq;
-  // initialize the updaters only when needed.
-  if (updater_seq != tparam_.updater_seq) {
-    this->updaters_.clear();
-  }
-
   std::vector<std::vector<std::unique_ptr<RegTree> > > new_trees;
   const int ngroup = model_.param.num_output_group;
+  ConfigureWithKnownData(this->cfg_, p_fmat);
   monitor_.Start("BoostNewTrees");
   if (ngroup == 1) {
     std::vector<std::unique_ptr<RegTree> > ret;
@@ -161,9 +187,9 @@ void GBTree::DoBoost(DMatrix* p_fmat,
     CHECK_EQ(in_gpair->Size() % ngroup, 0U)
         << "must have exactly ngroup*nrow gpairs";
     // TODO(canonizer): perform this on GPU if HostDeviceVector has device set.
-    HostDeviceVector<GradientPair> tmp
-        (in_gpair->Size() / ngroup, GradientPair(),
-         GPUDistribution::Block(in_gpair->Distribution().Devices()));
+    HostDeviceVector<GradientPair> tmp(in_gpair->Size() / ngroup,
+                                       GradientPair(),
+                                       in_gpair->DeviceIdx());
     const auto& gpair_h = in_gpair->ConstHostVector();
     auto nsize = static_cast<bst_omp_uint>(tmp.Size());
     for (int gid = 0; gid < ngroup; ++gid) {
@@ -178,18 +204,43 @@ void GBTree::DoBoost(DMatrix* p_fmat,
     }
   }
   monitor_.Stop("BoostNewTrees");
-  monitor_.Start("CommitModel");
   this->CommitModel(std::move(new_trees));
-  monitor_.Stop("CommitModel");
 }
 
-void GBTree::InitUpdater() {
-  if (updaters_.size() != 0) return;
+void GBTree::InitUpdater(Args const& cfg) {
   std::string tval = tparam_.updater_seq;
   std::vector<std::string> ups = common::Split(tval, ',');
+
+  if (updaters_.size() != 0) {
+    // Assert we have a valid set of updaters.
+    CHECK_EQ(ups.size(), updaters_.size());
+    for (auto const& up : updaters_) {
+      bool contains = std::any_of(ups.cbegin(), ups.cend(),
+                        [&up](std::string const& name) {
+                          return name == up->Name();
+                        });
+      if (!contains) {
+        std::stringstream ss;
+        ss << "Internal Error: " << " mismatched updater sequence.\n";
+        ss << "Specified updaters: ";
+        std::for_each(ups.cbegin(), ups.cend(),
+                      [&ss](std::string const& name){
+                        ss << name << " ";
+                      });
+        ss << "\n" << "Actual updaters: ";
+        std::for_each(updaters_.cbegin(), updaters_.cend(),
+                      [&ss](std::unique_ptr<TreeUpdater> const& updater){
+                        ss << updater->Name() << " ";
+                      });
+        LOG(FATAL) << ss.str();
+      }
+    }
+    return;
+  }
+
   for (const std::string& pstr : ups) {
     std::unique_ptr<TreeUpdater> up(TreeUpdater::Create(pstr.c_str(), learner_param_));
-    up->Init(this->cfg_);
+    up->Configure(cfg);
     updaters_.push_back(std::move(up));
   }
 }
@@ -198,7 +249,6 @@ void GBTree::BoostNewTrees(HostDeviceVector<GradientPair>* gpair,
                            DMatrix *p_fmat,
                            int bst_group,
                            std::vector<std::unique_ptr<RegTree> >* ret) {
-  this->InitUpdater();
   std::vector<RegTree*> new_trees;
   ret->clear();
   // create the trees
@@ -225,12 +275,15 @@ void GBTree::BoostNewTrees(HostDeviceVector<GradientPair>* gpair,
 }
 
 void GBTree::CommitModel(std::vector<std::vector<std::unique_ptr<RegTree>>>&& new_trees) {
+  monitor_.Start("CommitModel");
   int num_new_trees = 0;
   for (int gid = 0; gid < model_.param.num_output_group; ++gid) {
     num_new_trees += new_trees[gid].size();
     model_.CommitModel(std::move(new_trees[gid]), gid);
   }
-  predictor_->UpdatePredictionCache(model_, &updaters_, num_new_trees);
+  CHECK(configured_);
+  GetPredictor()->UpdatePredictionCache(model_, &updaters_, num_new_trees);
+  monitor_.Stop("CommitModel");
 }
 
 
@@ -239,10 +292,10 @@ class Dart : public GBTree {
  public:
   explicit Dart(bst_float base_margin) : GBTree(base_margin) {}
 
-  void Configure(const std::vector<std::pair<std::string, std::string> >& cfg) override {
+  void Configure(const Args& cfg) override {
     GBTree::Configure(cfg);
     if (model_.trees.size() == 0) {
-      dparam_.InitAllowUnknown(cfg);
+      dparam_.UpdateAllowUnknown(cfg);
     }
   }
 
@@ -292,7 +345,7 @@ class Dart : public GBTree {
   }
 
   bool UseGPU() const override {
-    return false;
+    return GBTree::UseGPU();
   }
 
  protected:
@@ -351,28 +404,30 @@ class Dart : public GBTree {
     CHECK_EQ(preds.size(), p_fmat->Info().num_row_ * num_group);
     // start collecting the prediction
     auto* self = static_cast<Derived*>(this);
-    for (const auto &batch : p_fmat->GetRowBatches()) {
+    for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
       constexpr int kUnroll = 8;
       const auto nsize = static_cast<bst_omp_uint>(batch.Size());
       const bst_omp_uint rest = nsize % kUnroll;
-      #pragma omp parallel for schedule(static)
-      for (bst_omp_uint i = 0; i < nsize - rest; i += kUnroll) {
-        const int tid = omp_get_thread_num();
-        RegTree::FVec& feats = thread_temp_[tid];
-        int64_t ridx[kUnroll];
-        SparsePage::Inst inst[kUnroll];
-        for (int k = 0; k < kUnroll; ++k) {
-          ridx[k] = static_cast<int64_t>(batch.base_rowid + i + k);
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          inst[k] = batch[i + k];
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          for (int gid = 0; gid < num_group; ++gid) {
-            const size_t offset = ridx[k] * num_group + gid;
-            preds[offset] +=
-                self->PredValue(inst[k], gid, info.GetRoot(ridx[k]),
-                                &feats, tree_begin, tree_end);
+      if (nsize >= kUnroll) {
+        #pragma omp parallel for schedule(static)
+        for (bst_omp_uint i = 0; i < nsize - rest; i += kUnroll) {
+          const int tid = omp_get_thread_num();
+          RegTree::FVec& feats = thread_temp_[tid];
+          int64_t ridx[kUnroll];
+          SparsePage::Inst inst[kUnroll];
+          for (int k = 0; k < kUnroll; ++k) {
+            ridx[k] = static_cast<int64_t>(batch.base_rowid + i + k);
+          }
+          for (int k = 0; k < kUnroll; ++k) {
+            inst[k] = batch[i + k];
+          }
+          for (int k = 0; k < kUnroll; ++k) {
+            for (int gid = 0; gid < num_group; ++gid) {
+              const size_t offset = ridx[k] * num_group + gid;
+              preds[offset] +=
+                  self->PredValue(inst[k], gid, info.GetRoot(ridx[k]),
+                                  &feats, tree_begin, tree_end);
+            }
           }
         }
       }

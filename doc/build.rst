@@ -13,8 +13,9 @@ Installation Guide
     #   * xgboost-{version}-py2.py3-none-win_amd64.whl
     pip3 install xgboost
 
-  * The binary wheel will support GPU algorithms (`gpu_exact`, `gpu_hist`) on machines with NVIDIA GPUs. Please note that **training with multiple GPUs is only supported for Linux platform**. See :doc:`gpu/index`.
+  * The binary wheel will support GPU algorithms (`gpu_hist`) on machines with NVIDIA GPUs. Please note that **training with multiple GPUs is only supported for Linux platform**. See :doc:`gpu/index`.
   * Currently, we provide binary wheels for 64-bit Linux and Windows.
+  * Nightly builds are available. You can now run *pip install https://s3-us-west-2.amazonaws.com/xgboost-nightly-builds/xgboost-[version]+[commit hash]-py2.py3-none-manylinux1_x86_64.whl* to install the nightly build with the given commit hash. See `this page <https://s3-us-west-2.amazonaws.com/xgboost-nightly-builds/list.html>`_ to see the list of all nightly builds.
 
 ****************************
 Building XGBoost from source
@@ -59,6 +60,8 @@ to ask questions at `the user forum <https://discuss.xgboost.ai>`_.
 * `Trouble Shooting`_
 * `Building the documentation`_
 
+.. _build_shared_lib:
+
 ***************************
 Building the Shared Library
 ***************************
@@ -70,8 +73,10 @@ Our goal is to build the shared library:
 
 The minimal building requirement is
 
-- A recent C++ compiler supporting C++11 (g++-4.8 or higher)
-- CMake 3.2 or higher
+- A recent C++ compiler supporting C++11 (g++-5.0 or higher)
+- CMake 3.3 or higher (3.12 for building with CUDA)
+
+For a list of CMake options, see ``#-- Options`` in CMakeLists.txt on top of source tree.
 
 Building on Ubuntu/Debian
 =========================
@@ -224,7 +229,7 @@ On Windows, run CMake as follows:
 
   .. code-block:: bash
 
-    make .. -G"Visual Studio 15 2017 Win64" -T v140,cuda=8.0 -DUSE_CUDA=ON
+    cmake .. -G"Visual Studio 15 2017 Win64" -T v140,cuda=8.0 -DUSE_CUDA=ON
 
 To speed up compilation, the compute version specific to your GPU could be passed to cmake as, e.g., ``-DGPU_COMPUTE_VER=50``.
 The above cmake configuration run will create an ``xgboost.sln`` solution file in the build directory. Build this solution in release mode as a x64 build, either from Visual studio or from command line:
@@ -371,7 +376,7 @@ Create the ``build/`` directory and invoke CMake with option ``R_LIB=ON``. Make 
 
   mkdir build
   cd build
-  CC=gcc-7 CXX=g++-7 cmake .. -DR_LIB=ON
+  CC=gcc-8 CXX=g++-8 cmake .. -DR_LIB=ON
   make -j4
   make install
 

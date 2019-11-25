@@ -10,33 +10,25 @@
 #include <dmlc/registry.h>
 #include <xgboost/base.h>
 #include <xgboost/data.h>
+#include <xgboost/model.h>
 #include <xgboost/generic_parameters.h>
+#include <xgboost/host_device_vector.h>
 
 #include <vector>
 #include <utility>
 #include <string>
 #include <functional>
 
-#include "../../src/common/host_device_vector.h"
-
 namespace xgboost {
 
 /*! \brief interface of objective function */
-class ObjFunction {
+class ObjFunction : public Configurable {
  protected:
-  LearnerTrainParam const* tparam_;
+  GenericParameter const* tparam_;
 
  public:
   /*! \brief virtual destructor */
   virtual ~ObjFunction() = default;
-  /*!
-   * \brief set configuration from pair iterators.
-   * \param begin The beginning iterator.
-   * \param end The end iterator.
-   * \tparam PairIter iterator<std::pair<std::string, std::string> >
-   */
-  template<typename PairIter>
-  inline void Configure(PairIter begin, PairIter end);
   /*!
    * \brief Configure the objective with the specified parameters.
    * \param args arguments to the objective function.
@@ -85,15 +77,8 @@ class ObjFunction {
    * \param tparam Generic parameters.
    * \param name Name of the objective.
    */
-  static ObjFunction* Create(const std::string& name, LearnerTrainParam const* tparam);
+  static ObjFunction* Create(const std::string& name, GenericParameter const* tparam);
 };
-
-// implementing configure.
-template<typename PairIter>
-inline void ObjFunction::Configure(PairIter begin, PairIter end) {
-  std::vector<std::pair<std::string, std::string> > vec(begin, end);
-  this->Configure(vec);
-}
 
 /*!
  * \brief Registry entry for objective factory functions.

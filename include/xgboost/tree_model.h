@@ -1,5 +1,5 @@
 /*!
- * Copyright 2014 by Contributors
+ * Copyright 2014-2019 by Contributors
  * \file tree_model.h
  * \brief model structure for tree
  * \author Tianqi Chen
@@ -9,16 +9,19 @@
 
 #include <dmlc/io.h>
 #include <dmlc/parameter.h>
+
+#include <xgboost/base.h>
+#include <xgboost/data.h>
+#include <xgboost/logging.h>
+#include <xgboost/feature_map.h>
+#include <xgboost/model.h>
+
 #include <limits>
 #include <vector>
 #include <string>
 #include <cstring>
 #include <algorithm>
 #include <tuple>
-#include "./base.h"
-#include "./data.h"
-#include "./logging.h"
-#include "./feature_map.h"
 
 namespace xgboost {
 
@@ -57,6 +60,7 @@ struct TreeParam : public dmlc::Parameter<TreeParam> {
     // other arguments are set by the algorithm.
     DMLC_DECLARE_FIELD(num_roots).set_lower_bound(1).set_default(1)
         .describe("Number of start root of trees.");
+    DMLC_DECLARE_FIELD(num_nodes).set_lower_bound(1).set_default(1);
     DMLC_DECLARE_FIELD(num_feature)
         .describe("Number of features used in tree construction.");
     DMLC_DECLARE_FIELD(size_leaf_vector).set_lower_bound(0).set_default(0)
@@ -80,7 +84,7 @@ struct RTreeNodeStat {
   /*! \brief weight of current node */
   bst_float base_weight;
   /*! \brief number of child that is leaf node known up to now */
-  int leaf_child_cnt;
+  int leaf_child_cnt {0};
   bool operator==(const RTreeNodeStat& b) const {
     return loss_chg == b.loss_chg && sum_hess == b.sum_hess &&
            base_weight == b.base_weight && leaf_child_cnt == b.leaf_child_cnt;
@@ -91,10 +95,11 @@ struct RTreeNodeStat {
  * \brief define regression tree to be the most common tree model.
  *  This is the data structure used in xgboost's major tree models.
  */
-class RegTree {
+class RegTree : public Model {
  public:
   /*! \brief auxiliary statistics of node to help tree building */
   using SplitCondT = bst_float;
+  static constexpr int32_t kInvalidNodeId {-1};
   /*! \brief tree node */
   class Node {
    public:
@@ -103,6 +108,12 @@ class RegTree {
       static_assert(sizeof(Node) == 4 * sizeof(int) + sizeof(Info),
                     "Node: 64 bit align");
     }
+    Node(int32_t cleft, int32_t cright, int32_t parent,
+         uint32_t split_ind, float split_cond, bool default_left) :
+        parent_{parent}, cleft_{cleft}, cright_{cright} {
+      this->SetSplit(split_ind, split_cond, default_left);
+    }
+
     /*! \brief index of left child */
     XGBOOST_DEVICE int LeftChild() const {
       return this->cleft_;
@@ -216,11 +227,11 @@ class RegTree {
     };
     // pointer to parent, highest bit is used to
     // indicate whether it's a left child or not
-    int parent_;
+    int32_t parent_{kInvalidNodeId};
     // pointer to left, right
-    int cleft_, cright_;
+    int32_t cleft_{kInvalidNodeId}, cright_{kInvalidNodeId};
     // split feature index, left split or right split depends on the highest bit
-    unsigned sindex_{0};
+    uint32_t sindex_{0};
     // extra info
     Info info_;
   };
@@ -287,38 +298,17 @@ class RegTree {
   const RTreeNodeStat& Stat(int nid) const {
     return stats_[nid];
   }
+
   /*!
    * \brief load model from stream
    * \param fi input stream
    */
-  void Load(dmlc::Stream* fi) {
-    CHECK_EQ(fi->Read(&param, sizeof(TreeParam)), sizeof(TreeParam));
-    nodes_.resize(param.num_nodes);
-    stats_.resize(param.num_nodes);
-    CHECK_NE(param.num_nodes, 0);
-    CHECK_EQ(fi->Read(dmlc::BeginPtr(nodes_), sizeof(Node) * nodes_.size()),
-             sizeof(Node) * nodes_.size());
-    CHECK_EQ(fi->Read(dmlc::BeginPtr(stats_), sizeof(RTreeNodeStat) * stats_.size()),
-             sizeof(RTreeNodeStat) * stats_.size());
-    // chg deleted nodes
-    deleted_nodes_.resize(0);
-    for (int i = param.num_roots; i < param.num_nodes; ++i) {
-      if (nodes_[i].IsDeleted()) deleted_nodes_.push_back(i);
-    }
-    CHECK_EQ(static_cast<int>(deleted_nodes_.size()), param.num_deleted);
-  }
+  void LoadModel(dmlc::Stream* fi) override;
   /*!
    * \brief save model to stream
    * \param fo output stream
    */
-  void Save(dmlc::Stream* fo) const {
-    CHECK_EQ(param.num_nodes, static_cast<int>(nodes_.size()));
-    CHECK_EQ(param.num_nodes, static_cast<int>(stats_.size()));
-    fo->Write(&param, sizeof(TreeParam));
-    CHECK_NE(param.num_nodes, 0);
-    fo->Write(dmlc::BeginPtr(nodes_), sizeof(Node) * nodes_.size());
-    fo->Write(dmlc::BeginPtr(stats_), sizeof(RTreeNodeStat) * nodes_.size());
-  }
+  void SaveModel(dmlc::Stream* fo) const override;
 
   bool operator==(const RegTree& b) const {
     return nodes_ == b.nodes_ && stats_ == b.stats_ &&
